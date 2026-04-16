@@ -1,0 +1,23 @@
+EXPERIMENT:
+  NAME: covl_seg_vitb_ade100
+  DATASET: ade20k_100
+  MODEL: vit_b16
+  SEED: 0
+
+TRAIN:
+  N_PRE: 200
+  N_MAIN: 4000
+  BATCH_SIZE: 8
+  LR: 3e-4
+  WEIGHT_DECAY: 1e-2
+  AMP: true
+
+CONTINUAL:
+  MIX_RATIO: [3, 1]
+  EPS_F: 0.05
+  M_MAX_PER_CLASS: 200
+  T_MEM: all
+
+FUSION:
+  TAU_PRED_INIT: 0.07
+  C0: 0.07
