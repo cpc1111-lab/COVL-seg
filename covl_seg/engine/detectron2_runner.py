@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional
 
 import torch
 from torch import nn
@@ -52,41 +53,235 @@ def _workspace_root() -> Path:
     return Path(__file__).resolve().parents[2]
 
 
-def _catseg_root() -> Path:
-    root = _workspace_root() / "CAT-Seg"
-    if not root.exists():
-        raise RuntimeError(f"CAT-Seg workspace was not found at expected path: {root}")
-    return root
+def _d2_project_root() -> Path:
+    env_root = os.environ.get("COVL_SEG_D2_PROJECT_ROOT", "").strip()
+    if env_root:
+        root = Path(env_root).expanduser().resolve()
+        if not root.exists():
+            raise RuntimeError(f"Configured Detectron2 project root does not exist: {root}")
+        return root
+
+    default_root = _workspace_root() / "covl_seg" / "vendor" / "covl_seg_d2_runtime"
+    if default_root.exists():
+        return default_root
+
+    raise RuntimeError(
+        "Unable to locate Detectron2 project root. "
+        "Expected internal runtime at covl_seg/vendor/covl_seg_d2_runtime or set "
+        "COVL_SEG_D2_PROJECT_ROOT to an external project root."
+    )
 
 
-def _resolve_catseg_config(config_path: str) -> Path:
+def _d2_entrypoint() -> str:
+    entrypoint = os.environ.get("COVL_SEG_D2_ENTRYPOINT", "").strip()
+    return entrypoint if entrypoint else "train_net.py"
+
+
+_SEG_NET_TO_CONFIG = {
+    "vitb": "vitb_384.yaml",
+    "vitl": "vitl_336.yaml",
+    "r50": "r50_384.yaml",
+    "r101": "r101_384.yaml",
+    "swin_t": "swin_t_384.yaml",
+    "swin_b": "swin_b_384.yaml",
+}
+
+
+def _infer_seg_network(config_path: str) -> str:
+    lowered = config_path.lower()
+    if "vitl" in lowered:
+        return "vitl"
+    if "r101" in lowered:
+        return "r101"
+    if "r50" in lowered:
+        return "r50"
+    if "swin_t" in lowered:
+        return "swin_t"
+    if "swin_b" in lowered:
+        return "swin_b"
+    return "vitb"
+
+
+def _resolve_d2_config(config_path: str, project_root: Path, seg_network: Optional[str] = None) -> Path:
     workspace = _workspace_root()
-    catseg = _catseg_root()
+    covl_config_root = (workspace / "covl_seg" / "configs").resolve()
 
     candidate = Path(config_path)
     if not candidate.is_absolute():
         candidate = (workspace / candidate).resolve()
-    if candidate.exists() and str(candidate).startswith(str(catseg.resolve())):
-        return candidate
+    if candidate.exists():
+        resolved = candidate.resolve()
+        if not str(resolved).startswith(str(covl_config_root)):
+            return resolved
 
-    lowered = config_path.lower()
-    fallback_name = "vitl_336.yaml" if "vitl" in lowered else "vitb_384.yaml"
-    fallback = catseg / "configs" / fallback_name
+    selected_network = (
+        (seg_network or "").strip().lower()
+        or os.environ.get("COVL_SEG_D2_SEG_NET", "").strip().lower()
+        or _infer_seg_network(config_path)
+    )
+    fallback_name = _SEG_NET_TO_CONFIG.get(selected_network)
+    if fallback_name is None:
+        valid = ", ".join(sorted(_SEG_NET_TO_CONFIG))
+        raise RuntimeError(
+            f"Unsupported segmentation network preset '{selected_network}'. Valid presets: {valid}"
+        )
+    fallback = project_root / "configs" / fallback_name
     if not fallback.exists():
-        raise RuntimeError(f"Unable to resolve CAT-Seg config. Missing fallback config: {fallback}")
+        raise RuntimeError(
+            f"Unable to resolve Detectron2 config. Missing config file: {fallback}. "
+            "You can set COVL_SEG_D2_SEG_NET to another preset or pass an explicit --config path."
+        )
     return fallback
 
 
-def _run_catseg_command(cmd: List[str], cwd: Path) -> None:
-    try:
-        subprocess.run(cmd, cwd=str(cwd), check=True, capture_output=True, text=True)
-    except subprocess.CalledProcessError as exc:
+def _run_d2_command_stream(
+    cmd: List[str],
+    cwd: Path,
+    env: Dict[str, str],
+    on_output: Callable[[str], None],
+) -> None:
+    process = subprocess.Popen(
+        cmd,
+        cwd=str(cwd),
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+    )
+    if process.stdout is None:
+        raise RuntimeError("Failed to stream Detectron2 command output")
+
+    for line in process.stdout:
+        print(line, end="")
+        on_output(line.rstrip("\n"))
+
+    rc = process.wait()
+    if rc != 0:
         raise RuntimeError(
-            "CAT-Seg command failed with exit code "
-            f"{exc.returncode}: {' '.join(cmd)}\n"
-            f"stdout:\n{exc.stdout}\n"
-            f"stderr:\n{exc.stderr}"
+            "Detectron2 command failed with exit code "
+            f"{rc}: {' '.join(cmd)}"
+        )
+
+
+def _run_d2_command(
+    cmd: List[str],
+    cwd: Path,
+    on_output: Optional[Callable[[str], None]] = None,
+) -> None:
+    env = os.environ.copy()
+    env.setdefault("DETECTRON2_DATASETS", str(_workspace_root() / "datasets"))
+    env.setdefault("PYTORCH_CUDA_ALLOC_CONF", "max_split_size_mb:128")
+
+    if on_output is not None:
+        _run_d2_command_stream(cmd=cmd, cwd=cwd, env=env, on_output=on_output)
+        return
+
+    try:
+        subprocess.run(cmd, cwd=str(cwd), check=True, env=env)
+    except subprocess.CalledProcessError as exc:
+        details = ""
+        if getattr(exc, "stderr", None):
+            details = f"\nstderr:\n{exc.stderr}"
+        elif getattr(exc, "output", None):
+            details = f"\noutput:\n{exc.output}"
+        raise RuntimeError(
+            "Detectron2 command failed with exit code "
+            f"{exc.returncode}: {' '.join(cmd)}{details}"
         ) from exc
+
+
+def _is_cuda_oom_error(error: RuntimeError) -> bool:
+    message = str(error).lower()
+    return "out of memory" in message or "cuda oom" in message
+
+
+def _is_nan_loss_error(error: RuntimeError) -> bool:
+    message = str(error).lower()
+    return "loss became infinite or nan" in message or "loss_sem_seg': nan" in message
+
+
+def _low_mem_override_profiles() -> List[List[str]]:
+    return [
+        [
+            "SOLVER.IMS_PER_BATCH",
+            "1",
+            "SOLVER.AMP.ENABLED",
+            "False",
+            "SOLVER.BASE_LR",
+            "0.0001",
+            "SOLVER.CLIP_GRADIENTS.CLIP_VALUE",
+            "0.005",
+            "DATALOADER.NUM_WORKERS",
+            "2",
+            "INPUT.CROP.SIZE",
+            "(320,320)",
+            "INPUT.MIN_SIZE_TRAIN",
+            "(320,)",
+        ],
+        [
+            "SOLVER.IMS_PER_BATCH",
+            "1",
+            "SOLVER.AMP.ENABLED",
+            "False",
+            "SOLVER.BASE_LR",
+            "0.00008",
+            "SOLVER.CLIP_GRADIENTS.CLIP_VALUE",
+            "0.003",
+            "DATALOADER.NUM_WORKERS",
+            "2",
+            "INPUT.CROP.SIZE",
+            "(256,256)",
+            "INPUT.MIN_SIZE_TRAIN",
+            "(256,)",
+            "MODEL.SEM_SEG_HEAD.POOLING_SIZES",
+            "[1,1]",
+        ],
+    ]
+
+
+def _default_stable_train_overrides() -> List[str]:
+    return [
+        "SOLVER.IMS_PER_BATCH",
+        "1",
+        "SOLVER.AMP.ENABLED",
+        "False",
+        "SOLVER.BASE_LR",
+        "0.0001",
+        "SOLVER.CLIP_GRADIENTS.CLIP_VALUE",
+        "0.005",
+        "DATALOADER.NUM_WORKERS",
+        "2",
+        "INPUT.CROP.SIZE",
+        "(256,256)",
+        "INPUT.MIN_SIZE_TRAIN",
+        "(256,)",
+        "MODEL.SEM_SEG_HEAD.POOLING_SIZES",
+        "[1,1]",
+    ]
+
+
+def _stability_override_profiles() -> List[List[str]]:
+    return [
+        [
+            "SOLVER.IMS_PER_BATCH",
+            "1",
+            "SOLVER.AMP.ENABLED",
+            "False",
+            "SOLVER.BASE_LR",
+            "0.0001",
+            "SOLVER.CLIP_GRADIENTS.CLIP_VALUE",
+            "0.005",
+            "DATALOADER.NUM_WORKERS",
+            "2",
+            "INPUT.CROP.SIZE",
+            "(256,256)",
+            "INPUT.MIN_SIZE_TRAIN",
+            "(256,)",
+            "MODEL.SEM_SEG_HEAD.POOLING_SIZES",
+            "[1,1]",
+        ]
+    ]
 
 
 def _extract_eval_metrics(eval_output: Path) -> Dict[str, float]:
@@ -125,7 +320,8 @@ def _extract_eval_metrics(eval_output: Path) -> Dict[str, float]:
 
 
 def _run_single_eval(
-    catseg_root: Path,
+    project_root: Path,
+    entrypoint: str,
     config_file: Path,
     output_dir: Path,
     weights: str,
@@ -134,7 +330,7 @@ def _run_single_eval(
 ) -> Dict[str, float]:
     cmd = [
         "python",
-        "train_net.py",
+        entrypoint,
         "--config-file",
         str(config_file),
         "--num-gpus",
@@ -155,7 +351,7 @@ def _run_single_eval(
         "DATASETS.TEST",
         f'("{dataset_name}",)',
     ]
-    _run_catseg_command(cmd=cmd, cwd=catseg_root)
+    _run_d2_command(cmd=cmd, cwd=project_root)
     return _extract_eval_metrics(eval_output=output_dir)
 
 
@@ -220,18 +416,22 @@ def run_detectron2_train(
     seed: int,
     resume_task: int,
     max_tasks: Optional[int],
+    seg_network: Optional[str] = None,
+    extra_overrides: Optional[List[str]] = None,
+    progress_callback: Optional[Callable[[str], None]] = None,
 ) -> Dict[str, int]:
     if not detectron2_available():
         raise RuntimeError("Detectron2 is not available in this environment")
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    catseg_root = _catseg_root()
-    resolved_config = _resolve_catseg_config(config_path)
+    project_root = _d2_project_root()
+    entrypoint = _d2_entrypoint()
+    resolved_config = _resolve_d2_config(config_path, project_root=project_root, seg_network=seg_network)
 
     cmd = [
         "python",
-        "train_net.py",
+        entrypoint,
         "--config-file",
         str(resolved_config),
         "--num-gpus",
@@ -243,8 +443,55 @@ def run_detectron2_train(
         str(output_dir),
         "SEED",
         str(seed),
-    ]
-    _run_catseg_command(cmd=cmd, cwd=catseg_root)
+    ] + _default_stable_train_overrides()
+    if extra_overrides:
+        cmd.extend(extra_overrides)
+    force_low_mem = os.environ.get("COVL_SEG_D2_FORCE_LOW_MEM", "0") == "1"
+    if force_low_mem:
+        last_exc: Optional[RuntimeError] = None
+        for idx, profile in enumerate(_low_mem_override_profiles(), start=1):
+            attempt_cmd = cmd + profile
+            try:
+                _run_d2_command(cmd=attempt_cmd, cwd=project_root, on_output=progress_callback)
+                break
+            except RuntimeError as exc:
+                if not (_is_cuda_oom_error(exc) or _is_nan_loss_error(exc)):
+                    raise
+                last_exc = exc
+                if idx == len(_low_mem_override_profiles()):
+                    raise last_exc
+    else:
+        try:
+            _run_d2_command(cmd=cmd, cwd=project_root, on_output=progress_callback)
+        except RuntimeError as exc:
+            if _is_cuda_oom_error(exc):
+                last_exc = exc
+                for idx, profile in enumerate(_low_mem_override_profiles(), start=1):
+                    retry_cmd = cmd + profile
+                    try:
+                        _run_d2_command(cmd=retry_cmd, cwd=project_root, on_output=progress_callback)
+                        break
+                    except RuntimeError as retry_exc:
+                        if not _is_cuda_oom_error(retry_exc):
+                            raise
+                        last_exc = retry_exc
+                        if idx == len(_low_mem_override_profiles()):
+                            raise last_exc
+            elif _is_nan_loss_error(exc):
+                last_exc = exc
+                for idx, profile in enumerate(_stability_override_profiles(), start=1):
+                    retry_cmd = cmd + profile
+                    try:
+                        _run_d2_command(cmd=retry_cmd, cwd=project_root, on_output=progress_callback)
+                        break
+                    except RuntimeError as retry_exc:
+                        if not _is_nan_loss_error(retry_exc):
+                            raise
+                        last_exc = retry_exc
+                        if idx == len(_stability_override_profiles()):
+                            raise last_exc
+            else:
+                raise
 
     num_tasks = max_tasks if max_tasks is not None else 1
 
@@ -262,7 +509,7 @@ def run_detectron2_train(
         "last_task": last_task,
         "num_phase_records": num_phase_records,
         "engine": "d2",
-        "backend": "cat_seg_train_net",
+        "backend": "d2_train_entrypoint",
     }
     ckpt = output_dir / f"checkpoint_task_{last_task:03d}.json"
     ckpt.write_text(json.dumps(checkpoint_payload, indent=2), encoding="utf-8")
@@ -279,17 +526,20 @@ def run_detectron2_eval(
     resume_task: int,
     checkpoint: Optional[str],
     open_vocab: bool,
+    seg_network: Optional[str] = None,
 ) -> Dict[str, float]:
     if not detectron2_available():
         raise RuntimeError("Detectron2 is not available in this environment")
 
     output_dir.mkdir(parents=True, exist_ok=True)
-    catseg_root = _catseg_root()
-    resolved_config = _resolve_catseg_config(config_path)
+    project_root = _d2_project_root()
+    entrypoint = _d2_entrypoint()
+    resolved_config = _resolve_d2_config(config_path, project_root=project_root, seg_network=seg_network)
     weights = checkpoint or str(output_dir / "model_final.pth")
 
     base_metrics = _run_single_eval(
-        catseg_root=catseg_root,
+        project_root=project_root,
+        entrypoint=entrypoint,
         config_file=resolved_config,
         output_dir=output_dir / "eval" / "ade150",
         weights=str(weights),
@@ -316,7 +566,8 @@ def run_detectron2_eval(
         ]
         for alias, class_json, dataset_name in ov_specs:
             metrics = _run_single_eval(
-                catseg_root=catseg_root,
+                project_root=project_root,
+                entrypoint=entrypoint,
                 config_file=resolved_config,
                 output_dir=output_dir / "eval" / alias,
                 weights=str(weights),

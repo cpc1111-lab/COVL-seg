@@ -23,6 +23,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Evaluation engine backend",
     )
     parser.add_argument("--open-vocab", action="store_true", help="Run PC59/PC459/VOC20 evaluations")
+    parser.add_argument(
+        "--seg-net",
+        choices=["vitb", "vitl", "r50", "r101", "swin_t", "swin_b"],
+        default=None,
+        help="Optional segmentation network preset for Detectron2 backend",
+    )
     return parser
 
 
@@ -52,6 +58,7 @@ def run_eval_once(
     checkpoint: Optional[str],
     open_vocab: bool,
     engine: str = "auto",
+    seg_net: Optional[str] = None,
 ) -> Dict[str, float]:
     backend = resolve_engine(requested=engine, detectron2_ready=detectron2_available())
     if backend == "d2":
@@ -61,6 +68,7 @@ def run_eval_once(
             resume_task=resume_task,
             checkpoint=checkpoint,
             open_vocab=open_vocab,
+            seg_network=seg_net,
         )
 
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -108,6 +116,7 @@ def main() -> None:
         "resume_task": args.resume_task,
         "checkpoint": args.checkpoint,
         "engine": args.engine,
+        "seg_net": args.seg_net,
         "open_vocab": args.open_vocab,
     }
     (out_dir / "eval_config.json").write_text(json.dumps(run_cfg, indent=2), encoding="utf-8")
@@ -118,6 +127,7 @@ def main() -> None:
         checkpoint=args.checkpoint,
         open_vocab=args.open_vocab,
         engine=args.engine,
+        seg_net=args.seg_net,
     )
     print(
         "Eval run complete: "

@@ -54,4 +54,6 @@ python covl_seg/scripts/train_continual.py --config covl_seg/configs/covl_seg_vi
 - `train_continual.py` and `eval_continual.py` support `--engine {auto,mock,d2}`.
 - `auto` selects Detectron2 when installed; otherwise it falls back to the deterministic mock engine.
 - Detectron2 mode runs through `covl_seg/engine/detectron2_runner.py` and writes the same artifact set (`metrics.jsonl`, task checkpoints, `eval_summary.json`).
+- Detectron2 mode is self-contained via `covl_seg/vendor/covl_seg_d2_runtime` by default; set `COVL_SEG_D2_PROJECT_ROOT=/path/to/your/seg-project` only if you want to override the bundled runtime.
+- Switch segmentation network presets with `--seg-net {vitb,vitl,r50,r101,swin_t,swin_b}` (or `COVL_SEG_D2_SEG_NET`) while keeping `covl_seg` configs as the main experiment config.
 - Detectron2 mode now builds and optimizes the current `COVLSegModel` composition (backbone + HCIBA + fusion path), while dataset/evaluator are still synthetic scaffolds pending full benchmark wiring.

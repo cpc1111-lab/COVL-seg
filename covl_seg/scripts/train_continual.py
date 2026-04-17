@@ -8,6 +8,11 @@ import torch
 from covl_seg.engine.hooks import append_metrics_jsonl
 from covl_seg.engine.detectron2_runner import detectron2_available, run_detectron2_train
 from covl_seg.engine.trainer import FourPhaseTrainer, PhaseController
+from covl_seg.scripts.bootstrap_coco_train import (
+    _resolve_d2_runtime_root,
+    ensure_coco_stuff_ready_for_training,
+    resolve_datasets_root,
+)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -24,6 +29,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="Training engine backend",
     )
     parser.add_argument("--smoke", action="store_true", help="Run short smoke-mode schedule")
+    parser.add_argument(
+        "--seg-net",
+        choices=["vitb", "vitl", "r50", "r101", "swin_t", "swin_b"],
+        default=None,
+        help="Optional segmentation network preset for Detectron2 backend",
+    )
+    parser.add_argument(
+        "--datasets-root",
+        default=None,
+        help="Dataset root; missing COCO-Stuff will be auto-downloaded here in d2 mode",
+    )
     return parser
 
 
@@ -85,17 +101,27 @@ def run_train_once(
     resume_task: int,
     max_tasks: Optional[int],
     engine: str = "auto",
+    seg_net: Optional[str] = None,
+    datasets_root: Optional[str] = None,
 ) -> Dict[str, int]:
     output_dir.mkdir(parents=True, exist_ok=True)
     backend = resolve_engine(requested=engine, detectron2_ready=detectron2_available())
 
     if backend == "d2":
+        repo_root = Path(__file__).resolve().parents[2]
+        resolved_datasets_root = resolve_datasets_root(datasets_root, repo_root=repo_root)
+        runtime_root = _resolve_d2_runtime_root(repo_root=repo_root)
+        ensure_coco_stuff_ready_for_training(
+            datasets_root=resolved_datasets_root,
+            runtime_root=runtime_root,
+        )
         return run_detectron2_train(
             config_path=config_path,
             output_dir=output_dir,
             seed=seed,
             resume_task=resume_task,
             max_tasks=max_tasks,
+            seg_network=seg_net,
         )
 
     trainer = _build_minimal_trainer(seed=seed)
@@ -138,6 +164,8 @@ def main() -> None:
         "max_tasks": args.max_tasks,
         "seed": args.seed,
         "engine": args.engine,
+        "seg_net": args.seg_net,
+        "datasets_root": args.datasets_root,
         "smoke": args.smoke,
     }
     (out_dir / "run_config.json").write_text(json.dumps(run_cfg, indent=2), encoding="utf-8")
@@ -153,6 +181,8 @@ def main() -> None:
         resume_task=args.resume_task,
         max_tasks=args.max_tasks,
         engine=args.engine,
+        seg_net=args.seg_net,
+        datasets_root=args.datasets_root,
     )
     print(
         "Train run complete: "

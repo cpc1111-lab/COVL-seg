@@ -15,6 +15,8 @@ def test_train_script_parser_has_core_args():
     assert args.output_dir == "work_dirs/dev"
     assert args.max_tasks is None
     assert args.engine == "auto"
+    assert args.seg_net is None
+    assert args.datasets_root is None
 
 
 def test_eval_script_parser_has_resume_task_arg():
@@ -31,6 +33,7 @@ def test_eval_script_parser_has_resume_task_arg():
     ])
     assert args.resume_task == 3
     assert args.engine == "auto"
+    assert args.seg_net is None
 
 
 def test_config_files_exist():
