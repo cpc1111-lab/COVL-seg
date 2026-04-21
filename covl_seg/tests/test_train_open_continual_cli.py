@@ -38,6 +38,48 @@ def test_parser_accepts_clip_and_method_modes():
     assert args.ewc_lambda == 12.5
 
 
+def test_parser_accepts_balanced_controller_args():
+    parser = build_parser()
+
+    defaults = parser.parse_args(
+        [
+            "--config",
+            "covl_seg/configs/covl_seg_vitb_ade15.yaml",
+            "--output-dir",
+            "work_dirs/dev",
+        ]
+    )
+    assert defaults.balanced_profile == "off"
+    assert defaults.target_delta_new == 0.30
+    assert defaults.epsilon_old == 0.20
+    assert defaults.epsilon_all == 0.15
+    assert defaults.epsilon_ov == 0.20
+
+    args = parser.parse_args(
+        [
+            "--config",
+            "covl_seg/configs/covl_seg_vitb_ade15.yaml",
+            "--output-dir",
+            "work_dirs/dev",
+            "--balanced-profile",
+            "balanced",
+            "--target-delta-new",
+            "0.42",
+            "--epsilon-old",
+            "0.11",
+            "--epsilon-all",
+            "0.12",
+            "--epsilon-ov",
+            "0.13",
+        ]
+    )
+    assert args.balanced_profile == "balanced"
+    assert args.target_delta_new == 0.42
+    assert args.epsilon_old == 0.11
+    assert args.epsilon_all == 0.12
+    assert args.epsilon_ov == 0.13
+
+
 def test_main_d2_bootstraps_datasets(monkeypatch, tmp_path):
     from covl_seg.scripts import train_open_continual as script
 

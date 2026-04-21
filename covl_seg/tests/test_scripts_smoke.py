@@ -49,3 +49,19 @@ def test_config_files_exist():
     }
     found = {p.name for p in cfg_dir.glob("*.yaml")}
     assert expected.issubset(found)
+
+
+def test_run_balanced_ablation_parser_has_required_args():
+    from covl_seg.scripts.run_balanced_ablation import build_parser
+
+    parser = build_parser()
+    args = parser.parse_args([
+        "--config",
+        "covl_seg/configs/covl_seg_vitb_ade15.yaml",
+        "--output-root",
+        "work_dirs/ablation",
+    ])
+    assert args.config.endswith("covl_seg_vitb_ade15.yaml")
+    assert args.output_root == "work_dirs/ablation"
+    assert args.engine == "mock"
+    assert args.seed == 0

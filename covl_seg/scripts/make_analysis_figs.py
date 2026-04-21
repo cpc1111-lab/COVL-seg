@@ -212,6 +212,11 @@ def generate_analysis_artifacts(metrics_jsonl: Path, output_dir: Path, run_dir: 
         "tau_pred",
         "fisher_energy",
         "ctr_loss",
+        "delta_new",
+        "delta_old",
+        "delta_all",
+        "ov_min_delta",
+        "alpha_floor",
     ]
     curves = {
         key: [
@@ -243,6 +248,10 @@ def generate_analysis_artifacts(metrics_jsonl: Path, output_dir: Path, run_dir: 
             current["mIoU_old"] = rec["mIoU_old"]
         if "mIoU_new" in rec:
             current["mIoU_new"] = rec["mIoU_new"]
+        if "ov_guard_triggered" in rec:
+            current["ov_guard_triggered"] = rec["ov_guard_triggered"]
+        if "ov_guard_state" in rec:
+            current["ov_guard_state"] = rec["ov_guard_state"]
 
     task_summary_json.write_text(json.dumps(task_summary, indent=2), encoding="utf-8")
 

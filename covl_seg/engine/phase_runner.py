@@ -69,6 +69,8 @@ def run_phase2_joint(task_id: int, cfg: Dict[str, object], batch: Optional[Dict[
         if bg_logits.ndim == 1:
             bg_logits = bg_logits.unsqueeze(0)
         ctr_loss = float(torch.topk(bg_logits, k=3, dim=1).values.mean().abs().item())
+        ctr_scale = max(0.0, float(cfg.get("balanced_w_ctr", 1.0)))
+        ctr_loss *= ctr_scale
         probs = torch.softmax(bg_logits, dim=1)
         tv_vals = []
         for i in range(probs.shape[0] - 1):
@@ -79,8 +81,13 @@ def run_phase2_joint(task_id: int, cfg: Dict[str, object], batch: Optional[Dict[
             gamma_clip = 0.0
 
     enable_projection = bool(cfg.get("enable_spectral_ogp", True))
+    g_stab = float(cfg.get("balanced_g_stab", 0.0))
+    w_oldfix = float(cfg.get("balanced_w_oldfix", 0.0))
     before_norm = float(torch.norm(grad).item())
     after_norm = float(torch.norm(proj_grad if enable_projection else grad).item())
+    after_norm = float(after_norm / (1.0 + max(0.0, g_stab)))
+    oldfix_base = float(torch.mean(torch.abs(grad - proj_grad)).item())
+    oldfix_weighted_term = float(max(0.0, w_oldfix) * oldfix_base)
 
     return {
         "phase": "phase2",
@@ -91,12 +98,15 @@ def run_phase2_joint(task_id: int, cfg: Dict[str, object], batch: Optional[Dict[
         "gamma_clip": gamma_clip,
         "proj_norm_before": before_norm,
         "proj_norm_after": after_norm,
+        "oldfix_weighted_term": oldfix_weighted_term,
     }
 
 
 def run_phase3_subspace_and_fusion(task_id: int, cfg: Dict[str, object], batch: Optional[Dict[str, object]] = None) -> Dict[str, float]:
     eps_f = float(cfg.get("eps_f", 0.05))
     alpha_star = 1.0 / (1.0 + math.exp(-0.2 * task_id))
+    alpha_floor = float(cfg.get("balanced_alpha_floor", 0.0))
+    alpha_star = max(alpha_star, alpha_floor)
     tau_pred = 0.07 * (1.0 + eps_f) / (task_id ** 0.25)
 
     dim = int(cfg.get("fisher_dim", 8))
@@ -125,10 +135,23 @@ def run_phase3_subspace_and_fusion(task_id: int, cfg: Dict[str, object], batch: 
 def run_phase4_replay_update(task_id: int, cfg: Dict[str, object], batch: Optional[Dict[str, object]] = None) -> Dict[str, float]:
     max_per_class = int(cfg.get("m_max_per_class", 200))
     max_total = int(cfg.get("m_max_total", max_per_class * 4))
+    rho_new = max(0.0, float(cfg.get("balanced_rho_new", 0.0)))
+    rho_old = max(0.0, float(cfg.get("balanced_rho_old", 0.0)))
     buffer = SACRReplayBuffer(max_total_items=max_total, max_per_class=max_per_class)
+    old_term_total = 0.0
+    new_term_total = 0.0
+    base_priority_total = 0.0
     for i in range(1, 6):
         class_id = (task_id + i) % 4
-        priority = float(1.0 / i)
+        base_priority = float(1.0 / i)
+        replay_newness = float(i / 5.0)
+        replay_oldness = float(1.0 - replay_newness)
+        new_term = base_priority * rho_new * replay_newness
+        old_term = base_priority * rho_old * replay_oldness
+        priority = float(base_priority + new_term + old_term)
+        base_priority_total += base_priority
+        old_term_total += old_term
+        new_term_total += new_term
         buffer.add(
             ReplayItem(
                 image_path=f"images/task_{task_id}_{i}.jpg",
@@ -143,5 +166,11 @@ def run_phase4_replay_update(task_id: int, cfg: Dict[str, object], batch: Option
         "task": float(task_id),
         "replay_budget": float(max_per_class),
         "replay_selected": float(selected),
+        "replay_rho_new": float(rho_new),
+        "replay_rho_old": float(rho_old),
+        "replay_priority_base": float(base_priority_total),
+        "replay_priority_new_term": float(new_term_total),
+        "replay_priority_old_term": float(old_term_total),
+        "replay_priority_total": float(base_priority_total + new_term_total + old_term_total),
         "loss": _deterministic_loss(task_id, 4),
     }

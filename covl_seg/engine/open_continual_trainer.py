@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 import time
 from dataclasses import dataclass
@@ -12,6 +13,11 @@ from tqdm.auto import tqdm
 
 from covl_seg.continual.methods import build_continual_method
 from covl_seg.continual.task_partition import TaskDef, TaskPlan, build_task_plan
+from covl_seg.engine.balanced_controller import (
+    BalancedControllerConfig,
+    BalancedControllerState,
+    update_controller_state,
+)
 from covl_seg.engine.detectron2_runner import run_detectron2_eval, run_detectron2_train
 from covl_seg.engine.hooks import append_metrics_jsonl
 from covl_seg.engine.phase_runner import (
@@ -110,6 +116,25 @@ def _compute_omega_tau_t(current_basis: List[float], basis_history: List[List[fl
         cos = torch.dot(prev, curr) / (prev_norm * curr_norm)
         overlaps.append(float(torch.clamp(cos * cos, 0.0, 1.0).item()))
     return max(overlaps) if overlaps else 0.0
+
+
+def _safe_float(value: object) -> Optional[float]:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if math.isfinite(parsed) else None
+
+
+def _safe_float_or(value: object, default: float) -> float:
+    parsed = _safe_float(value)
+    return default if parsed is None else parsed
+
+
+def _build_d2_progress_callback(task_id: int, total_tasks: int, task_total_iters: int):
+    iter_pattern = re.compile(r"iter:\s*(\d+)")
+    last_iter = {"value": -1}
+    started_at = time.monotonic()
 
 
 class _D2TaskProgress:
@@ -213,6 +238,11 @@ class OpenContinualTrainer:
     enable_ctr: bool
     enable_spectral_ogp: bool
     enable_sacr: bool
+    balanced_profile: str = "off"
+    target_delta_new: float = 0.30
+    epsilon_old: float = 0.20
+    epsilon_all: float = 0.15
+    epsilon_ov: float = 0.20
     seg_net: Optional[str] = None
     open_vocab_eval: bool = False
     skip_per_task_eval: bool = False
@@ -244,6 +274,11 @@ class OpenContinualTrainer:
             ewc_lambda=args.ewc_lambda,
             ewc_topk=args.ewc_topk,
             ewc_iters=args.ewc_iters,
+            balanced_profile=args.balanced_profile,
+            target_delta_new=args.target_delta_new,
+            epsilon_old=args.epsilon_old,
+            epsilon_all=args.epsilon_all,
+            epsilon_ov=args.epsilon_ov,
             enable_ciba=args.enable_ciba,
             enable_ctr=args.enable_ctr,
             enable_spectral_ogp=args.enable_spectral_ogp,
@@ -325,6 +360,22 @@ class OpenContinualTrainer:
         alpha_star_history = list(state.get("alpha_star_history", []))
         tau_pred_history = list(state.get("tau_pred_history", []))
         basis_history = list(state.get("basis_history", []))
+        balanced_prev_eval = dict(state.get("balanced_prev_eval", {}))
+
+        balanced_enabled = self.balanced_profile == "balanced"
+        balanced_cfg = BalancedControllerConfig(
+            epsilon_ov=self.epsilon_ov,
+            target_delta_new=self.target_delta_new,
+        )
+        balanced_state_payload = state.get("balanced_controller", {}) if balanced_enabled else {}
+        balanced_state = BalancedControllerState(
+            alpha_floor=_safe_float_or(balanced_state_payload.get("alpha_floor"), 0.0),
+            g_stab=_safe_float_or(balanced_state_payload.get("g_stab"), 0.0),
+            rho_old=_safe_float_or(balanced_state_payload.get("rho_old"), 0.0),
+            rho_new=_safe_float_or(balanced_state_payload.get("rho_new"), 0.0),
+            w_ctr=_safe_float_or(balanced_state_payload.get("w_ctr"), 0.0),
+            ov_guard_triggered=bool(balanced_state_payload.get("ov_guard_triggered", False)),
+        )
 
         task_cfg = {
             "n_pre": self.n_pre,
@@ -361,7 +412,24 @@ class OpenContinualTrainer:
             ) if self.engine == "d2" else None
             method.before_task(task_state={"task_id": task.task_id})
             method_phase_cfg = method.phase_overrides()
-            phase_cfg = {**task_cfg, **method_phase_cfg}
+            balanced_knobs = {
+                "balanced_w_ctr": 1.0,
+                "balanced_w_oldfix": 0.0,
+                "balanced_g_stab": 0.0,
+                "balanced_alpha_floor": 0.0,
+                "balanced_rho_new": 0.0,
+                "balanced_rho_old": 0.0,
+            }
+            if balanced_enabled:
+                balanced_knobs = {
+                    "balanced_w_ctr": float(balanced_state.w_ctr),
+                    "balanced_w_oldfix": float(balanced_state.rho_old),
+                    "balanced_g_stab": float(balanced_state.g_stab),
+                    "balanced_alpha_floor": float(balanced_state.alpha_floor),
+                    "balanced_rho_new": float(balanced_state.rho_new),
+                    "balanced_rho_old": float(balanced_state.rho_old),
+                }
+            phase_cfg = {**task_cfg, **method_phase_cfg, **balanced_knobs}
             batch = _build_phase_batch(task)
 
             p1 = run_phase1_hciba(task.task_id, phase_cfg, batch=batch)
@@ -384,6 +452,7 @@ class OpenContinualTrainer:
                 "0",
             ]
 
+            eval_payload = None
             if self.engine == "d2":
                 try:
                     run_detectron2_train(
@@ -459,10 +528,10 @@ class OpenContinualTrainer:
                         {
                             "task": float(task.task_id),
                             "phase": "eval",
-                            "mIoU_all": float(eval_payload.get("mIoU_all", float("nan"))),
-                            "mIoU_old": float(eval_payload.get("mIoU_old", float("nan"))),
-                            "mIoU_new": float(eval_payload.get("mIoU_new", float("nan"))),
-                            "BG-mIoU": float(eval_payload.get("BG-mIoU", float("nan"))),
+                            "mIoU_all": _safe_float(eval_payload.get("mIoU_all")),
+                            "mIoU_old": _safe_float(eval_payload.get("mIoU_old")),
+                            "mIoU_new": _safe_float(eval_payload.get("mIoU_new")),
+                            "BG-mIoU": _safe_float(eval_payload.get("BG-mIoU")),
                             "engine": "d2",
                         },
                     )
@@ -513,6 +582,64 @@ class OpenContinualTrainer:
                     record["proxy_source"] = "synthetic"
                     append_metrics_jsonl(self._metrics_path(), record)
 
+            if balanced_enabled:
+                current_eval = {
+                    "mIoU_all": _safe_float((eval_payload or {}).get("mIoU_all")),
+                    "mIoU_old": _safe_float((eval_payload or {}).get("mIoU_old")),
+                    "mIoU_new": _safe_float((eval_payload or {}).get("mIoU_new")),
+                }
+                prev_eval = {
+                    "mIoU_all": _safe_float(balanced_prev_eval.get("mIoU_all")),
+                    "mIoU_old": _safe_float(balanced_prev_eval.get("mIoU_old")),
+                    "mIoU_new": _safe_float(balanced_prev_eval.get("mIoU_new")),
+                }
+
+                required_metrics = ("mIoU_all", "mIoU_old", "mIoU_new")
+                has_finite_current = all(current_eval[key] is not None for key in required_metrics)
+                has_finite_prev = all(prev_eval[key] is not None for key in required_metrics)
+
+                delta_new = None
+                delta_old = None
+                delta_all = None
+                ov_min_delta = None
+
+                if has_finite_current and has_finite_prev:
+                    delta_new = float(current_eval["mIoU_new"] - prev_eval["mIoU_new"])
+                    delta_old = float(current_eval["mIoU_old"] - prev_eval["mIoU_old"])
+                    delta_all = float(current_eval["mIoU_all"] - prev_eval["mIoU_all"])
+                    ov_min_delta = float(min(delta_old, delta_all))
+                    signals = {
+                        "delta_new": delta_new,
+                        "delta_old": delta_old,
+                        "delta_all": delta_all,
+                        "ov_min_delta": ov_min_delta,
+                        "old_constraint_violated": delta_old < -self.epsilon_old,
+                        "all_constraint_violated": delta_all < -self.epsilon_all,
+                    }
+                    balanced_state = update_controller_state(
+                        state=balanced_state,
+                        cfg=balanced_cfg,
+                        signals=signals,
+                    )
+
+                append_metrics_jsonl(
+                    self._metrics_path(),
+                    {
+                        "task": float(task.task_id),
+                        "phase": "balanced_ctrl",
+                        "delta_new": delta_new,
+                        "delta_old": delta_old,
+                        "delta_all": delta_all,
+                        "ov_min_delta": ov_min_delta,
+                        "alpha_floor": _safe_float(balanced_state.alpha_floor),
+                        "ov_guard_triggered": bool(balanced_state.ov_guard_triggered),
+                        "ov_guard_state": bool(balanced_state.ov_guard_state),
+                    },
+                )
+
+                if has_finite_current:
+                    balanced_prev_eval = current_eval
+
             method_state = method.after_task(task_state={"task_id": task.task_id})
             alpha_star_history.append(float(p3["alpha_star"]))
             tau_pred_history.append(float(p3["tau_pred"]))
@@ -530,6 +657,21 @@ class OpenContinualTrainer:
                 "method_state": method_state.values,
                 "last_task_dir": str(task_dir),
             }
+            if balanced_enabled:
+                state["balanced_controller"] = {
+                    "alpha_floor": _safe_float(balanced_state.alpha_floor),
+                    "g_stab": _safe_float(balanced_state.g_stab),
+                    "rho_old": _safe_float(balanced_state.rho_old),
+                    "rho_new": _safe_float(balanced_state.rho_new),
+                    "w_ctr": _safe_float(balanced_state.w_ctr),
+                    "ov_guard_triggered": bool(balanced_state.ov_guard_triggered),
+                    "ov_guard_state": bool(balanced_state.ov_guard_state),
+                }
+                state["balanced_prev_eval"] = {
+                    "mIoU_all": _safe_float(balanced_prev_eval.get("mIoU_all")),
+                    "mIoU_old": _safe_float(balanced_prev_eval.get("mIoU_old")),
+                    "mIoU_new": _safe_float(balanced_prev_eval.get("mIoU_new")),
+                }
             self._write_json(self._state_path(), state)
             if self.engine != "d2":
                 print(
