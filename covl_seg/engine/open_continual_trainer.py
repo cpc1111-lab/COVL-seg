@@ -434,7 +434,7 @@ class OpenContinualTrainer:
 
             p1 = run_phase1_hciba(task.task_id, phase_cfg, batch=batch)
             p2 = run_phase2_joint(task.task_id, phase_cfg, batch=batch)
-            p3 = run_phase3_subspace_and_fusion(task.task_id, phase_cfg, batch=batch)
+            p3 = run_phase3_subspace_and_fusion(task.task_id, phase_cfg, batch=batch, prev_phase_metrics=p1)
             p4 = run_phase4_replay_update(task.task_id, phase_cfg, batch=batch)
 
             current_basis = p3.get("subspace_basis", [])
@@ -477,7 +477,7 @@ class OpenContinualTrainer:
                 d2_batch = _build_phase_batch_from_d2_metrics(task_dir=task_dir, fallback_batch=batch)
                 p1 = run_phase1_hciba(task.task_id, phase_cfg, batch=d2_batch)
                 p2 = run_phase2_joint(task.task_id, phase_cfg, batch=d2_batch)
-                p3 = run_phase3_subspace_and_fusion(task.task_id, phase_cfg, batch=d2_batch)
+                p3 = run_phase3_subspace_and_fusion(task.task_id, phase_cfg, batch=d2_batch, prev_phase_metrics=p1)
                 p4 = run_phase4_replay_update(task.task_id, phase_cfg, batch=d2_batch)
                 current_basis = p3.get("subspace_basis", [])
                 p3["omega_tau_t"] = float(_compute_omega_tau_t(current_basis, basis_history))

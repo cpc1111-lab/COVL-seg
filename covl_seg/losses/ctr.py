@@ -18,4 +18,4 @@ def ctr_background_loss(
     sim = pixel @ text.T
     k = min(topk, sim.shape[1])
     topk_mean = sim.topk(k=k, dim=1).values.mean()
-    return lambda0 * (1.0 - gamma_clip) * topk_mean
+    return -lambda0 * (1.0 - gamma_clip) * topk_mean

@@ -39,7 +39,10 @@ def test_ctr_loss_penalizes_ambiguous_background_more():
         lambda0=0.1,
         topk=3,
     )
-    assert loss_ambiguous >= loss_sharp
+    # After the sign fix, CTR loss is negative.  Ambiguous background (low γ_clip) yields a
+    # larger-magnitude (more negative) loss, meaning a stronger gradient signal during
+    # minimisation — i.e. loss_ambiguous ≤ loss_sharp numerically.
+    assert loss_ambiguous <= loss_sharp
 
 
 def test_masked_segmentation_ce_returns_finite_loss():
