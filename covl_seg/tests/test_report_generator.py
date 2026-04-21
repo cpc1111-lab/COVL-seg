@@ -142,6 +142,28 @@ def test_missing_metrics_jsonl_returns_empty(tmp_path):
     result = generate_report(run_dir=tmp_path)
 
     assert result == {}
+    assert not (tmp_path / "analysis").exists()
+
+
+def test_no_figures_generated_no_directory_created(tmp_path):
+    from covl_seg.engine.report_generator import generate_report
+
+    metrics = tmp_path / "metrics.jsonl"
+    metrics.write_text(
+        "\n".join(
+            [
+                json.dumps({"task": 1, "phase": "phase1", "beta_1_star": 0.1}),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    out = tmp_path / "analysis"
+    result = generate_report(run_dir=tmp_path, output_dir=out)
+
+    assert result == {}
+    assert not out.exists()
 
 
 def test_completed_zero_generate_report_not_called(tmp_path):
