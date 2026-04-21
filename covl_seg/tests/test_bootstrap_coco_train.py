@@ -333,7 +333,7 @@ def test_main_skips_extraction_when_coco_stuff_layout_exists(monkeypatch, tmp_pa
 
     assert download_calls == []
     assert extract_calls == []
-    assert len(prepare_calls) == 1
+    assert len(prepare_calls) == 0
     assert len(train_calls) == 1
 
 
@@ -381,6 +381,45 @@ def test_ensure_coco_stuff_ready_for_training_auto_downloads_when_missing(monkey
     assert calls["download"] == len(bootstrap.COCO_ARCHIVES)
     assert calls["extract"] == len(bootstrap.COCO_ARCHIVES)
     assert calls["prepare"] == 1
+    assert calls["validate"] == 1
+
+
+def test_ensure_coco_stuff_ready_skips_prepare_when_prepared_exists(monkeypatch, tmp_path):
+    from covl_seg.scripts import bootstrap_coco_train as bootstrap
+
+    calls = {"download": 0, "extract": 0, "prepare": 0, "validate": 0}
+
+    monkeypatch.setattr(bootstrap, "_coco_stuff_tree_exists", lambda _root: True)
+    monkeypatch.setattr(bootstrap, "_coco_stuff_prepared_tree_exists", lambda _root: True)
+    monkeypatch.setattr(
+        bootstrap,
+        "download_file_with_retries",
+        lambda *args, **kwargs: calls.__setitem__("download", calls["download"] + 1),
+    )
+    monkeypatch.setattr(
+        bootstrap,
+        "extract_archive",
+        lambda *args, **kwargs: calls.__setitem__("extract", calls["extract"] + 1),
+    )
+    monkeypatch.setattr(
+        bootstrap,
+        "run_prepare_coco_stuff",
+        lambda **kwargs: calls.__setitem__("prepare", calls["prepare"] + 1),
+    )
+    monkeypatch.setattr(
+        bootstrap,
+        "validate_coco_layout",
+        lambda _root: calls.__setitem__("validate", calls["validate"] + 1),
+    )
+
+    bootstrap.ensure_coco_stuff_ready_for_training(
+        datasets_root=tmp_path / "datasets",
+        runtime_root=tmp_path / "runtime",
+    )
+
+    assert calls["download"] == 0
+    assert calls["extract"] == 0
+    assert calls["prepare"] == 0
     assert calls["validate"] == 1
 
 

@@ -8,6 +8,16 @@ from covl_seg.scripts.bootstrap_coco_train import (
     ensure_coco_stuff_ready_for_training,
     resolve_datasets_root,
 )
+from covl_seg.scripts.bootstrap_open_vocab_data import ensure_open_vocab_eval_data_ready
+
+
+def _parse_bool_flag(value: str) -> bool:
+    lowered = str(value).strip().lower()
+    if lowered in {"1", "true", "yes", "y", "on"}:
+        return True
+    if lowered in {"0", "false", "no", "n", "off"}:
+        return False
+    raise argparse.ArgumentTypeError(f"Invalid boolean value: {value}")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -38,6 +48,23 @@ def build_parser() -> argparse.ArgumentParser:
         help="Optional segmentation network preset for Detectron2 backend",
     )
     parser.add_argument("--open-vocab", action="store_true")
+    parser.add_argument(
+        "--skip-per-task-eval",
+        action="store_true",
+        help="Skip per-task Detectron2 evaluation during training",
+    )
+    parser.add_argument(
+        "--eval-sliding-window",
+        type=_parse_bool_flag,
+        default=True,
+        help="Use sliding-window inference for per-task eval (true/false)",
+    )
+    parser.add_argument(
+        "--eval-max-samples-per-task",
+        type=int,
+        default=None,
+        help="Optional cap for per-task eval sample count",
+    )
 
     parser.add_argument("--n-pre", type=int, default=200)
     parser.add_argument("--n-main", type=int, default=4000)
@@ -78,6 +105,11 @@ def main() -> None:
             datasets_root=resolved_datasets_root,
             runtime_root=runtime_root,
         )
+        if args.open_vocab:
+            ensure_open_vocab_eval_data_ready(
+                datasets_root=resolved_datasets_root,
+                runtime_root=runtime_root,
+            )
 
     run_cfg = vars(args).copy()
     (out_dir / "open_run_config.json").write_text(json.dumps(run_cfg, indent=2), encoding="utf-8")

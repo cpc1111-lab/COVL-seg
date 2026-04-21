@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 import torch
+from tqdm.auto import tqdm
 
 from covl_seg.continual.methods import build_continual_method
 from covl_seg.continual.task_partition import TaskDef, TaskPlan, build_task_plan
@@ -41,10 +42,12 @@ def _write_task_class_indexes(task_dir: Path, task: TaskDef) -> Dict[str, Path]:
     split_dir = task_dir / "splits"
     split_dir.mkdir(parents=True, exist_ok=True)
     train_indexes = split_dir / "seen_indexes.json"
+    new_indexes = split_dir / "new_indexes.json"
     test_indexes = split_dir / "unseen_indexes.json"
     train_indexes.write_text(json.dumps(task.seen_classes, indent=2), encoding="utf-8")
+    new_indexes.write_text(json.dumps(task.new_classes, indent=2), encoding="utf-8")
     test_indexes.write_text(json.dumps(task.background_classes, indent=2), encoding="utf-8")
-    return {"train": train_indexes, "test": test_indexes}
+    return {"train": train_indexes, "new": new_indexes, "test": test_indexes}
 
 
 def _build_phase_batch(task: TaskDef) -> Dict[str, object]:
@@ -109,34 +112,79 @@ def _compute_omega_tau_t(current_basis: List[float], basis_history: List[List[fl
     return max(overlaps) if overlaps else 0.0
 
 
-def _build_d2_progress_callback(task_id: int, total_tasks: int, task_total_iters: int):
-    iter_pattern = re.compile(r"iter:\s*(\d+)")
-    last_iter = {"value": -1}
-    started_at = time.monotonic()
+class _D2TaskProgress:
+    def __init__(self, task_id: int, total_tasks: int, task_total_iters: int, show_train: bool = True):
+        self.task_id = task_id
+        self.total_tasks = total_tasks
+        self.task_total_iters = max(task_total_iters, 1)
+        self._iter_pattern = re.compile(r"iter:\s*(\d+)")
+        self._infer_pattern = re.compile(r"Inference done\s+(\d+)/(\d+)")
+        self._train_pbar = None
+        if show_train:
+            self._train_pbar = tqdm(
+                total=self.task_total_iters,
+                desc=f"task {task_id}/{total_tasks} train",
+                dynamic_ncols=True,
+                leave=True,
+            )
+        self._eval_pbar = None
+        self._last_iter = -1
+        self._train_finalize_notified = False
+        self._train_started_at = time.monotonic()
 
-    def _on_output(line: str) -> None:
-        match = iter_pattern.search(line)
+    def train_callback(self, line: str) -> None:
+        if self._train_pbar is None:
+            return
+        match = self._iter_pattern.search(line)
         if not match:
             return
         current_iter = int(match.group(1))
-        if current_iter == last_iter["value"]:
+        if current_iter == self._last_iter:
             return
-        last_iter["value"] = current_iter
-        remaining = max(task_total_iters - current_iter, 0)
-        progress_pct = 100.0 * min(max(current_iter, 0), max(task_total_iters, 1)) / max(task_total_iters, 1)
-        elapsed = max(1e-6, time.monotonic() - started_at)
-        iter_rate = max(current_iter, 1) / elapsed
-        eta_sec = int(max(remaining, 0) / max(iter_rate, 1e-6))
-        print(
-            "[open-continual] "
-            f"task {task_id}/{total_tasks} progress | "
-            f"iter={current_iter}/{task_total_iters} | "
-            f"remaining_task_iters={remaining} | "
-            f"task_progress_pct={progress_pct:.1f} | "
-            f"task_eta_sec={eta_sec}"
-        )
+        self._last_iter = current_iter
+        self._train_pbar.n = min(max(current_iter + 1, 0), self.task_total_iters)
+        self._train_pbar.refresh()
+        if (
+            self._train_pbar.n >= self.task_total_iters
+            and not self._train_finalize_notified
+        ):
+            self._train_finalize_notified = True
+            tqdm.write(
+                "[open-continual] "
+                f"task {self.task_id}/{self.total_tasks} train finalize | "
+                "waiting for checkpoint write"
+            )
 
-    return _on_output
+    def eval_callback(self, line: str) -> None:
+        match = self._infer_pattern.search(line)
+        if not match:
+            return
+        done = int(match.group(1))
+        total = max(int(match.group(2)), 1)
+        if self._eval_pbar is None or self._eval_pbar.total != total:
+            if self._eval_pbar is not None:
+                self._eval_pbar.close()
+            self._eval_pbar = tqdm(
+                total=total,
+                desc=f"task {self.task_id}/{self.total_tasks} eval",
+                dynamic_ncols=True,
+                leave=True,
+            )
+        self._eval_pbar.n = min(max(done, 0), total)
+        self._eval_pbar.refresh()
+
+    def close(self) -> None:
+        if self._eval_pbar is not None:
+            self._eval_pbar.n = self._eval_pbar.total
+            self._eval_pbar.refresh()
+            self._eval_pbar.close()
+        if self._train_pbar is not None:
+            self._train_pbar.n = self._train_pbar.total
+            self._train_pbar.refresh()
+            self._train_pbar.close()
+
+    def train_elapsed_sec(self) -> int:
+        return int(max(0.0, time.monotonic() - self._train_started_at))
 
 
 @dataclass
@@ -167,6 +215,9 @@ class OpenContinualTrainer:
     enable_sacr: bool
     seg_net: Optional[str] = None
     open_vocab_eval: bool = False
+    skip_per_task_eval: bool = False
+    eval_sliding_window: bool = True
+    eval_max_samples_per_task: Optional[int] = None
     resume_task: int = 0
 
     @classmethod
@@ -198,15 +249,30 @@ class OpenContinualTrainer:
             enable_spectral_ogp=args.enable_spectral_ogp,
             enable_sacr=args.enable_sacr,
             open_vocab_eval=args.open_vocab,
+            skip_per_task_eval=args.skip_per_task_eval,
+            eval_sliding_window=args.eval_sliding_window,
+            eval_max_samples_per_task=args.eval_max_samples_per_task,
             resume_task=args.resume_task,
         )
 
     def _build_task_plan(self) -> TaskPlan:
         total_classes = _infer_num_classes_from_config(self.config_path)
+        resolved_num_tasks = self.num_tasks
+        resolved_classes_per_task = self.classes_per_task
+
+        if self.task_spec is None:
+            if resolved_num_tasks is None and resolved_classes_per_task is None:
+                resolved_num_tasks = 1
+                resolved_classes_per_task = total_classes
+            elif resolved_num_tasks is None and resolved_classes_per_task is not None:
+                resolved_num_tasks = max(1, (total_classes + resolved_classes_per_task - 1) // resolved_classes_per_task)
+            elif resolved_num_tasks is not None and resolved_classes_per_task is None:
+                resolved_classes_per_task = max(1, (total_classes + resolved_num_tasks - 1) // resolved_num_tasks)
+
         return build_task_plan(
             task_spec=self.task_spec,
-            num_tasks=self.num_tasks,
-            classes_per_task=self.classes_per_task,
+            num_tasks=resolved_num_tasks,
+            classes_per_task=resolved_classes_per_task,
             all_classes=list(range(total_classes)),
             seed=self.task_seed,
         )
@@ -288,12 +354,11 @@ class OpenContinualTrainer:
             task_dir = self.output_dir / f"task_{task.task_id:03d}"
             total_tasks = len(plan.tasks)
             remaining_tasks = max(0, total_tasks - task.task_id)
-            print(
-                "[open-continual] "
-                f"task {task.task_id}/{total_tasks} start | "
-                f"task_iters={self.n_main} | remaining_task_iters={self.n_main} | "
-                f"remaining_tasks={remaining_tasks}"
-            )
+            progress = _D2TaskProgress(
+                task_id=task.task_id,
+                total_tasks=total_tasks,
+                task_total_iters=self.n_main,
+            ) if self.engine == "d2" else None
             method.before_task(task_state={"task_id": task.task_id})
             method_phase_cfg = method.phase_overrides()
             phase_cfg = {**task_cfg, **method_phase_cfg}
@@ -316,24 +381,30 @@ class OpenContinualTrainer:
                 "SOLVER.MAX_ITER",
                 str(self.n_main),
                 "TEST.EVAL_PERIOD",
-                str(max(1, self.n_main)),
+                "0",
             ]
 
             if self.engine == "d2":
-                run_detectron2_train(
-                    config_path=self.config_path,
-                    output_dir=task_dir,
-                    seed=self.seed,
-                    resume_task=task.task_id - 1,
-                    max_tasks=1,
-                    seg_network=self.seg_net,
-                    extra_overrides=task_overrides,
-                    progress_callback=_build_d2_progress_callback(
-                        task_id=task.task_id,
-                        total_tasks=total_tasks,
-                        task_total_iters=self.n_main,
-                    ),
-                )
+                try:
+                    run_detectron2_train(
+                        config_path=self.config_path,
+                        output_dir=task_dir,
+                        seed=self.seed,
+                        resume_task=task.task_id - 1,
+                        max_tasks=1,
+                        seg_network=self.seg_net,
+                        extra_overrides=task_overrides,
+                        progress_callback=progress.train_callback if progress is not None else None,
+                    )
+                    if progress is not None:
+                        print(
+                            "[open-continual] "
+                            f"task {task.task_id}/{total_tasks} train done | "
+                            f"elapsed_sec={progress.train_elapsed_sec()}"
+                        )
+                finally:
+                    if progress is not None:
+                        progress.close()
                 d2_batch = _build_phase_batch_from_d2_metrics(task_dir=task_dir, fallback_batch=batch)
                 p1 = run_phase1_hciba(task.task_id, phase_cfg, batch=d2_batch)
                 p2 = run_phase2_joint(task.task_id, phase_cfg, batch=d2_batch)
@@ -346,26 +417,97 @@ class OpenContinualTrainer:
                     record["proxy_source"] = "d2_metrics"
                     append_metrics_jsonl(self._metrics_path(), record)
 
-                eval_payload = run_detectron2_eval(
-                    config_path=self.config_path,
-                    output_dir=task_dir,
-                    resume_task=task.task_id,
-                    checkpoint=None,
-                    open_vocab=self.open_vocab_eval,
-                    seg_network=self.seg_net,
+                print(
+                    "[open-continual] "
+                    f"task {task.task_id}/{total_tasks} continual | "
+                    f"beta_1_star={float(p1.get('beta_1_star', float('nan'))):.4f} | "
+                    f"ctr_loss={float(p2.get('ctr_loss', float('nan'))):.4f} | "
+                    f"alpha_star={float(p3.get('alpha_star', float('nan'))):.4f} | "
+                    f"tau_pred={float(p3.get('tau_pred', float('nan'))):.4f} | "
+                    f"omega_tau_t={float(p3.get('omega_tau_t', float('nan'))):.4f}"
                 )
-                append_metrics_jsonl(
-                    self._metrics_path(),
-                    {
-                        "task": float(task.task_id),
-                        "phase": "eval",
-                        "mIoU_all": float(eval_payload.get("mIoU_all", float("nan"))),
-                        "mIoU_old": float(eval_payload.get("mIoU_old", float("nan"))),
-                        "mIoU_new": float(eval_payload.get("mIoU_new", float("nan"))),
-                        "BG-mIoU": float(eval_payload.get("BG-mIoU", float("nan"))),
-                        "engine": "d2",
-                    },
-                )
+
+                if not self.skip_per_task_eval:
+                    print(
+                        "[open-continual] "
+                        f"task {task.task_id}/{total_tasks} eval start | "
+                        f"sliding_window={self.eval_sliding_window} | "
+                        f"max_samples={self.eval_max_samples_per_task}"
+                    )
+                    eval_progress = _D2TaskProgress(
+                        task_id=task.task_id,
+                        total_tasks=total_tasks,
+                        task_total_iters=1,
+                        show_train=False,
+                    )
+                    try:
+                        eval_payload = run_detectron2_eval(
+                            config_path=self.config_path,
+                            output_dir=task_dir,
+                            resume_task=task.task_id,
+                            checkpoint=None,
+                            open_vocab=self.open_vocab_eval,
+                            seg_network=self.seg_net,
+                            eval_sliding_window=self.eval_sliding_window,
+                            eval_max_samples=self.eval_max_samples_per_task,
+                            progress_callback=eval_progress.eval_callback,
+                        )
+                    finally:
+                        eval_progress.close()
+                    append_metrics_jsonl(
+                        self._metrics_path(),
+                        {
+                            "task": float(task.task_id),
+                            "phase": "eval",
+                            "mIoU_all": float(eval_payload.get("mIoU_all", float("nan"))),
+                            "mIoU_old": float(eval_payload.get("mIoU_old", float("nan"))),
+                            "mIoU_new": float(eval_payload.get("mIoU_new", float("nan"))),
+                            "BG-mIoU": float(eval_payload.get("BG-mIoU", float("nan"))),
+                            "engine": "d2",
+                        },
+                    )
+                    print(
+                        "[open-continual] "
+                        f"task {task.task_id}/{total_tasks} eval result | "
+                        f"mIoU_all={float(eval_payload.get('mIoU_all', float('nan'))):.3f} | "
+                        f"mIoU_old={float(eval_payload.get('mIoU_old', float('nan'))):.3f} | "
+                        f"mIoU_new={float(eval_payload.get('mIoU_new', float('nan'))):.3f} | "
+                        f"BG-mIoU={float(eval_payload.get('BG-mIoU', float('nan'))):.3f}"
+                    )
+
+                    class_iou_all = eval_payload.get("class_iou_all")
+                    if isinstance(class_iou_all, dict) and class_iou_all:
+                        old_map = eval_payload.get("class_iou_old")
+                        new_map = eval_payload.get("class_iou_new")
+                        bg_map = eval_payload.get("class_iou_bg")
+                        old_names = set(old_map.keys()) if isinstance(old_map, dict) else set()
+                        new_names = set(new_map.keys()) if isinstance(new_map, dict) else set()
+                        bg_names = set(bg_map.keys()) if isinstance(bg_map, dict) else set()
+                        print(
+                            "[open-continual] "
+                            f"task {task.task_id}/{total_tasks} class IoU detail | "
+                            f"count={len(class_iou_all)}"
+                        )
+                        for class_name in sorted(class_iou_all):
+                            if class_name in new_names:
+                                group = "new"
+                            elif class_name in old_names:
+                                group = "old"
+                            elif class_name in bg_names:
+                                group = "bg"
+                            else:
+                                group = "other"
+                            print(
+                                "[open-continual] "
+                                f"task {task.task_id}/{total_tasks} class IoU | "
+                                f"group={group} | class={class_name} | IoU={float(class_iou_all[class_name]):.3f}"
+                            )
+                else:
+                    print(
+                        "[open-continual] "
+                        f"task {task.task_id}/{total_tasks} eval skipped | "
+                        "per-task eval disabled"
+                    )
             else:
                 for record in (p1, p2, p3, p4):
                     record["proxy_source"] = "synthetic"
@@ -389,11 +531,12 @@ class OpenContinualTrainer:
                 "last_task_dir": str(task_dir),
             }
             self._write_json(self._state_path(), state)
-            print(
-                "[open-continual] "
-                f"task {task.task_id}/{total_tasks} done | remaining_task_iters=0 | "
-                f"remaining_tasks={remaining_tasks}"
-            )
+            if self.engine != "d2":
+                print(
+                    "[open-continual] "
+                    f"task {task.task_id}/{total_tasks} done | remaining_task_iters=0 | "
+                    f"remaining_tasks={remaining_tasks}"
+                )
             completed += 1
 
         return {

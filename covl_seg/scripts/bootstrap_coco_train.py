@@ -198,6 +198,14 @@ def _coco_stuff_tree_exists(datasets_root: Path) -> bool:
     return all(path.is_dir() for path in required_dirs)
 
 
+def _coco_stuff_prepared_tree_exists(datasets_root: Path) -> bool:
+    required_dirs = [
+        datasets_root / "coco-stuff" / "annotations_detectron2" / "train2017",
+        datasets_root / "coco-stuff" / "annotations_detectron2" / "val2017",
+    ]
+    return all(path.is_dir() for path in required_dirs)
+
+
 def ensure_coco_stuff_ready_for_training(
     datasets_root: Path,
     runtime_root: Path,
@@ -205,6 +213,11 @@ def ensure_coco_stuff_ready_for_training(
 ) -> None:
     coco_stuff_root = datasets_root / "coco-stuff"
     archive_root = datasets_root / "coco_archives"
+
+    if _coco_stuff_tree_exists(datasets_root) and _coco_stuff_prepared_tree_exists(datasets_root) and not force_download:
+        print(f"Found prepared COCO-Stuff tree: {coco_stuff_root}; skipping download/extract/prepare")
+        validate_coco_layout(datasets_root)
+        return
 
     if _coco_stuff_tree_exists(datasets_root) and not force_download:
         print(f"Found existing COCO-Stuff tree: {coco_stuff_root}")
@@ -220,7 +233,11 @@ def ensure_coco_stuff_ready_for_training(
             )
             extract_archive(downloaded_archive, extract_target)
 
-    run_prepare_coco_stuff(runtime_root=runtime_root, datasets_root=datasets_root)
+    if not _coco_stuff_prepared_tree_exists(datasets_root) or force_download:
+        run_prepare_coco_stuff(runtime_root=runtime_root, datasets_root=datasets_root)
+    else:
+        print("Found existing prepared annotations_detectron2 tree; skipping prepare step")
+
     validate_coco_layout(datasets_root)
 
 

@@ -34,6 +34,8 @@ def test_eval_script_parser_has_resume_task_arg():
     assert args.resume_task == 3
     assert args.engine == "auto"
     assert args.seg_net is None
+    assert args.eval_sliding_window is True
+    assert args.eval_max_samples is None
 
 
 def test_config_files_exist():

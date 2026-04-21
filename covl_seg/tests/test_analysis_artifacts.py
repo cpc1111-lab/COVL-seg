@@ -21,7 +21,35 @@ def test_generate_analysis_artifacts_writes_proxy_curves(tmp_path):
     )
 
     out = tmp_path / "analysis"
-    payload = generate_analysis_artifacts(metrics_jsonl=metrics, output_dir=out)
+    run_dir = tmp_path / "run"
+    task1 = run_dir / "task_001"
+    task2 = run_dir / "task_002"
+    task1.mkdir(parents=True, exist_ok=True)
+    task2.mkdir(parents=True, exist_ok=True)
+    (task1 / "eval_summary.json").write_text(
+        json.dumps(
+            {
+                "class_iou_all": {"person": 10.0, "car": 20.0},
+                "class_iou_old": {"person": 10.0},
+                "class_iou_new": {"car": 20.0},
+                "class_iou_bg": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+    (task2 / "eval_summary.json").write_text(
+        json.dumps(
+            {
+                "class_iou_all": {"person": 30.0, "car": 40.0},
+                "class_iou_old": {"person": 30.0, "car": 40.0},
+                "class_iou_new": {},
+                "class_iou_bg": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    payload = generate_analysis_artifacts(metrics_jsonl=metrics, output_dir=out, run_dir=run_dir)
     assert payload["num_records"] == 6
     curves = json.loads((out / "analysis_curves.json").read_text(encoding="utf-8"))
     assert "beta_1_star" in curves
@@ -33,3 +61,11 @@ def test_generate_analysis_artifacts_writes_proxy_curves(tmp_path):
     assert "2" in task_summary
     assert task_summary["1"]["beta_1_star"] == 0.1
     assert task_summary["2"]["omega_tau_t"] == 0.41
+
+    class_trends = json.loads((out / "analysis_class_iou_trends.json").read_text(encoding="utf-8"))
+    assert "car" in class_trends
+    assert class_trends["car"][0]["group"] == "new"
+    assert class_trends["car"][1]["group"] == "old"
+
+    assert (out / "fig_group_miou_trends.png").exists()
+    assert (out / "fig_class_trends" / "car.png").exists()
