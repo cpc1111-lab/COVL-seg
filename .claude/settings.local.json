@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -m pytest covl_seg/tests/ -x -q)",
+      "Bash(python -m pytest covl_seg/tests/ -x -q --ignore=covl_seg/tests/test_bootstrap_open_vocab_data.py)",
+      "Bash(python -m pytest covl_seg/tests/ -q --ignore=covl_seg/tests/test_bootstrap_open_vocab_data.py --ignore=covl_seg/tests/test_detectron2_bridge_commands.py)",
+      "Bash(python -m pytest covl_seg/tests/test_losses_numeric.py -v)",
+      "Bash(python -m pytest covl_seg/tests/ -q --ignore=covl_seg/tests/test_bootstrap_open_vocab_data.py --ignore=covl_seg/tests/test_detectron2_bridge_commands.py --ignore=covl_seg/tests/test_runtime_branding.py)",
+      "Bash(python -m pytest covl_seg/tests/test_open_continual_trainer.py::test_trainer_d2_passes_task_and_clip_overrides -v)",
+      "Bash(python -m pytest covl_seg/tests/ -q)"
+    ]
+  }
+}

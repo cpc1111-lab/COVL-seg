@@ -38,5 +38,5 @@ class FusionHead(nn.Module):
 
         seg_log_prob = nn.functional.log_softmax(seg_logits, dim=1)
         clip_log_prob = nn.functional.log_softmax(clip_logits, dim=1)
-        fused = (alpha_map * seg_log_prob + (1.0 - alpha_map) * clip_log_prob) / max(self.tau, 1e-6)
+        fused = (alpha_map * clip_log_prob + (1.0 - alpha_map) * seg_log_prob) / max(self.tau, 1e-6)
         return fused
