@@ -292,6 +292,13 @@ def generate_analysis_artifacts(metrics_jsonl: Path, output_dir: Path, run_dir: 
     _plot_global_trends(group_rows, output_dir / "fig_group_miou_trends.png")
     _plot_class_trends(class_trends, output_dir / "fig_class_trends")
 
+    try:
+        from covl_seg.engine.report_generator import generate_report
+        generated = generate_report(run_dir=actual_run_dir, output_dir=output_dir / "analysis")
+        summary_payload["figures_generated"] = list(generated.keys())
+    except Exception as exc:
+        summary_payload["figures_generated"] = []
+
     return summary_payload
 
 

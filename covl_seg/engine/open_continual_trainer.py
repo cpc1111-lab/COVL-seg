@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import math
 import re
 import time
@@ -10,6 +11,8 @@ from typing import Dict, List, Optional
 
 import torch
 from tqdm.auto import tqdm
+
+_log = logging.getLogger(__name__)
 
 from covl_seg.continual.methods import build_continual_method
 from covl_seg.continual.task_partition import TaskDef, TaskPlan, build_task_plan
@@ -680,6 +683,14 @@ class OpenContinualTrainer:
                     f"remaining_tasks={remaining_tasks}"
                 )
             completed += 1
+
+        if completed > 0:
+            try:
+                from covl_seg.engine.report_generator import generate_report
+                generated = generate_report(run_dir=self.output_dir)
+                _log.info("[report] generated %d figures → %s", len(generated), self.output_dir / "analysis")
+            except Exception as exc:
+                _log.warning("[report] chart generation skipped: %s", exc)
 
         return {
             "tasks_executed": float(completed),
