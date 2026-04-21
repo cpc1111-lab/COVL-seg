@@ -49,6 +49,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ewc-lambda", type=float, default=10.0)
     parser.add_argument("--ewc-topk", type=int, default=8)
     parser.add_argument("--ewc-iters", type=int, default=25)
+    parser.add_argument("--balanced-profile", choices=["off", "balanced"], default="off")
+    parser.add_argument("--target-delta-new", type=float, default=0.30)
+    parser.add_argument("--epsilon-old", type=float, default=0.20)
+    parser.add_argument("--epsilon-all", type=float, default=0.15)
+    parser.add_argument("--epsilon-ov", type=float, default=0.20)
 
     parser.add_argument("--enable-ciba", dest="enable_ciba", action="store_true")
     parser.add_argument("--disable-ciba", dest="enable_ciba", action="store_false")
