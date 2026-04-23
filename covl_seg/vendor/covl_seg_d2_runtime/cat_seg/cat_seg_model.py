@@ -1,6 +1,7 @@
 # Copyright (c) Facebook, Inc. and its affiliates.
 import copy
 import json
+import logging
 from pathlib import Path
 from typing import List, Optional, Tuple
 
@@ -18,7 +19,21 @@ from detectron2.utils.memory import _ignore_torch_cuda_oom
 
 from einops import rearrange
 
+from covl_seg.losses.ciba import ciba_alignment_loss
+from covl_seg.losses.ctr import ctr_background_loss
+from covl_seg.losses.mine import MINECritic, mine_lower_bound
+
 from .continual_losses import kd_loss_on_class_indexes
+from .utils.class_masking import (
+    load_visible_class_indexes,
+    mask_logits_and_targets_to_visible_classes,
+)
+
+
+_MINE_SAMPLE = 512
+_TEACHER_LOAD_MISMATCH_LIMIT = 8
+_TEACHER_LOAD_MISMATCH_FRACTION = 0.5
+_LOGGER = logging.getLogger(__name__)
 
 
 def _load_class_indexes(index_path: str) -> List[int]:
@@ -52,6 +67,12 @@ class CATSeg(nn.Module):
         old_teacher_weights: str,
         distill_temp: float,
         lambda_old_kd: float,
+        enable_ciba: bool = False,
+        enable_ctr: bool = False,
+        beta_star: float = 0.0,
+        gamma_clip: float = 0.0,
+        lambda0_ctr: float = 0.1,
+        background_ids: List[int] = (),
         sliding_window: bool,
         clip_finetune: str,
         backbone_multiplier: float,
@@ -75,6 +96,10 @@ class CATSeg(nn.Module):
         
         self.train_class_json = train_class_json
         self.test_class_json = test_class_json
+        self.visible_class_indexes = load_visible_class_indexes(
+            path_value=train_class_indexes,
+            num_classes=int(self.sem_seg_head.num_classes),
+        )
         self.train_class_indexes = _load_class_indexes(train_class_indexes)
         self.old_class_indexes = _load_class_indexes(train_old_class_indexes)
         self.old_teacher_weights = old_teacher_weights
@@ -82,6 +107,13 @@ class CATSeg(nn.Module):
         self.lambda_old_kd = float(lambda_old_kd)
         self._old_teacher: Optional[nn.Module] = None
         self._old_teacher_load_attempted = False
+
+        self.enable_ciba = bool(enable_ciba)
+        self.enable_ctr = bool(enable_ctr)
+        self.beta_star = float(beta_star)
+        self.gamma_clip = float(gamma_clip)
+        self.lambda0_ctr = float(lambda0_ctr)
+        self.background_ids = list(background_ids)
 
         self.clip_finetune = clip_finetune
         for name, params in self.sem_seg_head.predictor.clip_model.named_parameters():
@@ -109,6 +141,7 @@ class CATSeg(nn.Module):
         self.proj_dim = 768 if clip_pretrained == "ViT-B/16" else 1024
         self.upsample1 = nn.ConvTranspose2d(self.proj_dim, 256, kernel_size=2, stride=2)
         self.upsample2 = nn.ConvTranspose2d(self.proj_dim, 128, kernel_size=4, stride=4)
+        self.mine_critic = MINECritic(feature_dim=self.proj_dim) if self.enable_ciba else None
 
         self.layer_indexes = [3, 7] if clip_pretrained == "ViT-B/16" else [7, 15] 
         self.layers = []
@@ -136,6 +169,12 @@ class CATSeg(nn.Module):
             "old_teacher_weights": cfg.MODEL.SEM_SEG_HEAD.OLD_TEACHER_WEIGHTS,
             "distill_temp": cfg.MODEL.SEM_SEG_HEAD.DISTILL_TEMP,
             "lambda_old_kd": cfg.MODEL.SEM_SEG_HEAD.LAMBDA_OLD_KD,
+            "enable_ciba": cfg.MODEL.COVL.ENABLE_CIBA,
+            "enable_ctr": cfg.MODEL.COVL.ENABLE_CTR,
+            "beta_star": getattr(cfg.MODEL.COVL, "BETA_STAR", 0.0),
+            "gamma_clip": getattr(cfg.MODEL.COVL, "GAMMA_CLIP", 0.0),
+            "lambda0_ctr": getattr(cfg.MODEL.COVL, "LAMBDA0_CTR", 0.1),
+            "background_ids": list(getattr(cfg.MODEL.COVL, "BACKGROUND_IDS", [])),
             "sliding_window": cfg.TEST.SLIDING_WINDOW,
             "clip_finetune": cfg.MODEL.SEM_SEG_HEAD.CLIP_FINETUNE,
             "backbone_multiplier": cfg.SOLVER.BACKBONE_MULTIPLIER,
@@ -145,6 +184,58 @@ class CATSeg(nn.Module):
     @property
     def device(self):
         return self.pixel_mean.device
+
+    def _get_text_features(self) -> torch.Tensor:
+        text_feats = self.sem_seg_head.predictor.text_features
+        return F.normalize(text_feats.to(self.device), dim=-1)
+
+    def _compute_ciba_loss(self, res3: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        _, channels, height, width = res3.shape
+        projected = res3.permute(0, 2, 3, 1).reshape(-1, channels)
+        targets_small = F.interpolate(
+            targets.float().unsqueeze(1), size=(height, width), mode="nearest"
+        ).squeeze(1).long()
+
+        try:
+            text_feats = self._get_text_features()
+        except AttributeError:
+            return torch.tensor(0.0, device=self.device)
+
+        valid = (targets_small != self.sem_seg_head.ignore_value).reshape(-1)
+        if int(valid.sum().item()) <= 1:
+            return torch.tensor(0.0, device=self.device)
+
+        projected_valid = projected[valid]
+        classes_valid = targets_small.reshape(-1)[valid].clamp(0, text_feats.shape[0] - 1)
+        text_valid = text_feats[classes_valid]
+
+        sample_count = min(_MINE_SAMPLE, projected_valid.shape[0])
+        sample_indexes = torch.randperm(projected_valid.shape[0], device=self.device)[:sample_count]
+        projected_sample = projected_valid[sample_indexes]
+        text_sample = text_valid[sample_indexes]
+
+        mi_est = mine_lower_bound(self.mine_critic, projected_sample, text_sample)
+        return ciba_alignment_loss(projected_sample, text_sample, mi_est, self.beta_star)
+
+    def _compute_ctr_loss(self, res3: torch.Tensor) -> torch.Tensor:
+        _, channels, _, _ = res3.shape
+        projected = res3.permute(0, 2, 3, 1).reshape(-1, channels)
+
+        try:
+            text_feats = self._get_text_features()
+        except AttributeError:
+            return torch.tensor(0.0, device=self.device)
+
+        bg_ids = torch.tensor(self.background_ids, device=self.device, dtype=torch.long)
+        sample_count = min(_MINE_SAMPLE, projected.shape[0])
+        sample_indexes = torch.randperm(projected.shape[0], device=self.device)[:sample_count]
+        return ctr_background_loss(
+            projected[sample_indexes],
+            text_feats,
+            bg_ids,
+            self.gamma_clip,
+            self.lambda0_ctr,
+        )
 
     def _get_old_teacher(self) -> Optional[nn.Module]:
         if self._old_teacher is not None:
@@ -168,7 +259,25 @@ class CATSeg(nn.Module):
             if key.startswith("sem_seg_head.")
         }
         load_state = teacher_state if teacher_state else state_dict
-        teacher.load_state_dict(load_state, strict=False)
+        incompatible = teacher.load_state_dict(load_state, strict=False)
+        missing_count = len(incompatible.missing_keys)
+        unexpected_count = len(incompatible.unexpected_keys)
+        mismatch_count = missing_count + unexpected_count
+        teacher_key_count = max(len(teacher.state_dict()), 1)
+        mismatch_limit = max(
+            _TEACHER_LOAD_MISMATCH_LIMIT,
+            int(teacher_key_count * _TEACHER_LOAD_MISMATCH_FRACTION),
+        )
+        if mismatch_count > mismatch_limit:
+            _LOGGER.warning(
+                "Skipping old teacher load from %s due to key mismatch "
+                "(missing=%d, unexpected=%d, limit=%d).",
+                teacher_path,
+                missing_count,
+                unexpected_count,
+                mismatch_limit,
+            )
+            return None
         teacher.to(self.device)
         teacher.eval()
         for param in teacher.parameters():
@@ -245,9 +354,21 @@ class CATSeg(nn.Module):
             _targets = torch.zeros(outputs.shape, device=self.device)
             _onehot = F.one_hot(targets[mask], num_classes=num_classes).float()
             _targets[mask] = _onehot
+
+            outputs, _targets = mask_logits_and_targets_to_visible_classes(
+                logits=outputs,
+                targets=_targets,
+                visible_class_indexes=self.visible_class_indexes,
+            )
             
             loss = F.binary_cross_entropy_with_logits(outputs, _targets)
             losses = {"loss_sem_seg" : loss}
+            if self.enable_ciba and self.mine_critic is not None:
+                losses["loss_ciba"] = self._compute_ciba_loss(res3, targets)
+
+            if self.enable_ctr and self.background_ids:
+                losses["loss_ctr"] = self._compute_ctr_loss(res3)
+
             if teacher_outputs is not None and self.lambda_old_kd > 0:
                 losses["loss_old_kd"] = self.lambda_old_kd * kd_loss_on_class_indexes(
                     student_logits=student_outputs,
