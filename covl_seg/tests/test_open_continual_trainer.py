@@ -829,8 +829,8 @@ def test_trainer_d2_summarizes_real_continual_loss_fields(tmp_path, monkeypatch)
         (out / "metrics.json").write_text(
             "\n".join(
                 [
-                    '{"iteration":0,"total_loss":1.0,"loss_sem_seg":0.6,"loss_old_kd":0.2,"loss_old_clip":0.18,"loss_unseen_clip":0.16,"loss_ciba":0.14,"loss_ctr":0.12}',
-                    '{"iteration":1,"total_loss":0.9,"loss_sem_seg":0.5,"loss_old_kd":0.15,"loss_old_clip":0.12,"loss_unseen_clip":0.1,"loss_ciba":0.08,"loss_ctr":0.06}',
+                    '{"iteration":0,"total_loss":1.0,"loss_sem_seg":1.0,"loss_old_kd":0.2,"loss_old_clip":0.1,"loss_unseen_clip":0.05,"loss_ciba":0.15,"loss_ctr":0.1}',
+                    '{"iteration":1,"total_loss":0.9,"loss_sem_seg":0.9,"loss_old_kd":0.1,"loss_old_clip":0.08,"loss_unseen_clip":0.04,"loss_ciba":0.11,"loss_ctr":0.07}',
                 ]
             )
             + "\n",
@@ -886,12 +886,12 @@ def test_trainer_d2_summarizes_real_continual_loss_fields(tmp_path, monkeypatch)
     metrics = [json.loads(line) for line in metrics_lines]
     task_summary = next(m for m in metrics if m.get("phase") == "task_summary")
 
-    assert task_summary["loss_sem_seg"] > 0.0
-    assert task_summary["loss_old_kd"] > 0.0
-    assert task_summary["loss_old_clip"] > 0.0
-    assert task_summary["loss_unseen_clip"] > 0.0
-    assert task_summary["loss_ciba"] > 0.0
-    assert task_summary["loss_ctr"] > 0.0
+    assert task_summary["loss_sem_seg"] == pytest.approx(0.95)
+    assert task_summary["loss_old_kd"] == pytest.approx(0.15)
+    assert task_summary["loss_old_clip"] == pytest.approx(0.09)
+    assert task_summary["loss_unseen_clip"] == pytest.approx(0.045)
+    assert task_summary["loss_ciba"] == pytest.approx(0.13)
+    assert task_summary["loss_ctr"] == pytest.approx(0.085)
 
 
 def test_trainer_d2_writes_task_conditioned_class_json_artifacts(tmp_path, monkeypatch):
