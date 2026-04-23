@@ -734,6 +734,15 @@ def _extract_train_records(output_dir: Path, resume_task: int, num_tasks: int) -
 
     num_records = 0
     phase_names = ["phase1", "phase2", "phase3", "phase4"]
+    loss_keys = [
+        "loss_sem_seg",
+        "loss_old_kd",
+        "loss_old_clip",
+        "loss_unseen_clip",
+        "loss_ciba",
+        "loss_ctr",
+        "ctr_loss",
+    ]
     for line in source.read_text(encoding="utf-8").splitlines():
         line = line.strip()
         if not line:
@@ -745,6 +754,17 @@ def _extract_train_records(output_dir: Path, resume_task: int, num_tasks: int) -
         loss = record.get("total_loss")
         if loss is None:
             continue
+        per_loss_values = {}
+        for key in loss_keys:
+            value = record.get(key)
+            if value is None:
+                continue
+            try:
+                parsed = float(value)
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(parsed):
+                per_loss_values[key] = parsed
         iter_value = int(record.get("iteration", num_records))
         append_metrics_jsonl(
             target,
@@ -754,6 +774,7 @@ def _extract_train_records(output_dir: Path, resume_task: int, num_tasks: int) -
                 "iter": float(iter_value),
                 "loss": float(loss),
                 "engine": "d2",
+                **per_loss_values,
             },
         )
         num_records += 1

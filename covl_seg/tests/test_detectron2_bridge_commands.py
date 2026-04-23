@@ -33,8 +33,30 @@ def test_run_detectron2_train_invokes_catseg_train_net(monkeypatch, tmp_path: Pa
     (out_dir / "metrics.json").write_text(
         "\n".join(
             [
-                json.dumps({"iteration": 0, "total_loss": 1.2}),
-                json.dumps({"iteration": 1, "total_loss": 0.8}),
+                json.dumps(
+                    {
+                        "iteration": 0,
+                        "total_loss": 1.2,
+                        "loss_sem_seg": 0.7,
+                        "loss_old_kd": 0.3,
+                        "loss_old_clip": 0.25,
+                        "loss_unseen_clip": 0.22,
+                        "loss_ciba": 0.18,
+                        "loss_ctr": 0.16,
+                    }
+                ),
+                json.dumps(
+                    {
+                        "iteration": 1,
+                        "total_loss": 0.8,
+                        "loss_sem_seg": 0.6,
+                        "loss_old_kd": 0.2,
+                        "loss_old_clip": 0.2,
+                        "loss_unseen_clip": 0.18,
+                        "loss_ciba": 0.15,
+                        "loss_ctr": 0.12,
+                    }
+                ),
             ]
         )
         + "\n",
@@ -80,6 +102,14 @@ def test_run_detectron2_train_invokes_catseg_train_net(monkeypatch, tmp_path: Pa
     assert second["phase"] == "phase2"
     assert first["task"] == 3.0
     assert second["task"] == 3.0
+    assert first["loss_sem_seg"] == 0.7
+    assert first["loss_old_kd"] == 0.3
+    assert first["loss_old_clip"] == 0.25
+    assert first["loss_unseen_clip"] == 0.22
+    assert first["loss_ciba"] == 0.18
+    assert first["loss_ctr"] == 0.16
+    assert second["loss_sem_seg"] == 0.6
+    assert second["loss_ctr"] == 0.12
 
 
 def test_run_detectron2_eval_invokes_eval_only(monkeypatch, tmp_path: Path):
