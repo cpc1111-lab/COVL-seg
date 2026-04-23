@@ -31,8 +31,6 @@ from .utils.class_masking import (
 
 
 _MINE_SAMPLE = 512
-_TEACHER_LOAD_MISMATCH_LIMIT = 8
-_TEACHER_LOAD_MISMATCH_FRACTION = 0.5
 _LOGGER = logging.getLogger(__name__)
 
 
@@ -259,23 +257,13 @@ class CATSeg(nn.Module):
             if key.startswith("sem_seg_head.")
         }
         load_state = teacher_state if teacher_state else state_dict
-        incompatible = teacher.load_state_dict(load_state, strict=False)
-        missing_count = len(incompatible.missing_keys)
-        unexpected_count = len(incompatible.unexpected_keys)
-        mismatch_count = missing_count + unexpected_count
-        teacher_key_count = max(len(teacher.state_dict()), 1)
-        mismatch_limit = max(
-            _TEACHER_LOAD_MISMATCH_LIMIT,
-            int(teacher_key_count * _TEACHER_LOAD_MISMATCH_FRACTION),
-        )
-        if mismatch_count > mismatch_limit:
+        try:
+            teacher.load_state_dict(load_state, strict=True)
+        except RuntimeError as exc:
             _LOGGER.warning(
-                "Skipping old teacher load from %s due to key mismatch "
-                "(missing=%d, unexpected=%d, limit=%d).",
+                "Skipping old teacher load from %s due to strict state mismatch: %s",
                 teacher_path,
-                missing_count,
-                unexpected_count,
-                mismatch_limit,
+                exc,
             )
             return None
         teacher.to(self.device)

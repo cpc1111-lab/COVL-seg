@@ -160,6 +160,9 @@ def _build_runtime_training_model(module):
     model.lambda0_ctr = 0.1
     model.background_ids = []
     model.mine_critic = None
+    model.old_teacher_weights = ""
+    model._old_teacher = None
+    model._old_teacher_load_attempted = False
 
     class _FakeClipModel(nn.Module):
         def __init__(self, owner):
@@ -182,6 +185,7 @@ def _build_runtime_training_model(module):
             super().__init__()
             self.ignore_value = 255
             self.num_classes = 3
+            self.teacher_scale = nn.Parameter(torch.tensor(1.0))
             self.predictor = types.SimpleNamespace(
                 clip_model=_FakeClipModel(owner),
                 text_features=torch.randn(3, owner.proj_dim),
@@ -189,10 +193,9 @@ def _build_runtime_training_model(module):
 
         def forward(self, clip_features, features):
             del clip_features, features
-            return torch.randn(1, self.num_classes, 24, 24)
+            return self.teacher_scale * torch.randn(1, self.num_classes, 24, 24)
 
     model.sem_seg_head = _FakeSemSegHead(model)
-    model._get_old_teacher = lambda: None
     model.train()
     return model
 
@@ -260,18 +263,18 @@ def test_cat_seg_training_skips_old_kd_without_teacher_or_old_indexes(monkeypatc
     assert "loss_old_kd" not in losses
 
 
-def test_cat_seg_training_emits_old_kd_when_teacher_and_old_indexes_available(monkeypatch):
+def test_cat_seg_training_emits_old_kd_when_teacher_state_is_compatible(monkeypatch, tmp_path):
     module = _load_runtime_cat_seg_model_module(monkeypatch)
     model = _build_runtime_training_model(module)
     model.lambda_old_kd = 0.5
     model.old_class_indexes = [0, 1]
-
-    class _Teacher(nn.Module):
-        def forward(self, clip_features, features):
-            del clip_features, features
-            return torch.zeros(1, 3, 24, 24)
-
-    model._get_old_teacher = lambda: _Teacher()
+    checkpoint_path = tmp_path / "teacher_ok.pth"
+    teacher_state = {
+        f"sem_seg_head.{key}": value.clone()
+        for key, value in model.sem_seg_head.state_dict().items()
+    }
+    torch.save({"model": teacher_state}, checkpoint_path)
+    model.old_teacher_weights = str(checkpoint_path)
 
     losses = model(_build_training_batch())
 
@@ -329,7 +332,7 @@ def test_get_old_teacher_returns_none_for_empty_teacher_path(monkeypatch):
     assert model._get_old_teacher() is None
 
 
-def test_get_old_teacher_fails_closed_on_large_state_mismatch(monkeypatch, tmp_path, caplog):
+def test_get_old_teacher_fails_closed_on_incompatible_state(monkeypatch, tmp_path, caplog):
     module = _load_runtime_cat_seg_model_module(monkeypatch)
     cat_seg_cls = module.CATSeg
     model = cat_seg_cls.__new__(cat_seg_cls)
@@ -341,7 +344,7 @@ def test_get_old_teacher_fails_closed_on_large_state_mismatch(monkeypatch, tmp_p
     model._old_teacher_load_attempted = False
 
     checkpoint_path = tmp_path / "bad_teacher.pth"
-    bad_state = {f"sem_seg_head.fake_{idx}": torch.randn(2, 2) for idx in range(16)}
+    bad_state = {"sem_seg_head.fake_weight": torch.randn(2, 2)}
     torch.save({"model": bad_state}, checkpoint_path)
     model.old_teacher_weights = str(checkpoint_path)
 
@@ -350,3 +353,4 @@ def test_get_old_teacher_fails_closed_on_large_state_mismatch(monkeypatch, tmp_p
 
     assert teacher is None
     assert "Skipping old teacher load" in caplog.text
+    assert "strict state mismatch" in caplog.text
