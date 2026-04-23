@@ -621,6 +621,65 @@ def test_trainer_d2_passes_task_and_clip_overrides(tmp_path, monkeypatch, capsys
     assert "eval result" in output
 
 
+def test_trainer_d2_passes_continual_runtime_flags(tmp_path, monkeypatch):
+    cfg = _write_mock_config(tmp_path)
+    calls = []
+
+    def _fake_train(**kwargs):
+        calls.append(kwargs)
+        out = kwargs["output_dir"]
+        out.mkdir(parents=True, exist_ok=True)
+        (out / "metrics.json").write_text('{"iteration":0,"total_loss":1.0}\n', encoding="utf-8")
+        return {"num_tasks": 1, "num_phase_records": 1, "last_task": 1}
+
+    monkeypatch.setattr("covl_seg.engine.open_continual_trainer.run_detectron2_train", _fake_train)
+    monkeypatch.setattr("covl_seg.engine.open_continual_trainer.run_detectron2_eval", lambda **kwargs: {"mIoU_all": 1.0})
+    monkeypatch.setattr(
+        "covl_seg.engine.open_continual_trainer._resolve_task_class_names",
+        lambda _cfg: [f"class_{idx}" for idx in range(150)],
+    )
+
+    trainer = OpenContinualTrainer(
+        config_path=str(cfg),
+        output_dir=tmp_path / "run_d2_flags",
+        engine="d2",
+        seed=0,
+        method_name="covl",
+        clip_finetune="attention",
+        task_spec=None,
+        num_tasks=1,
+        classes_per_task=2,
+        task_seed=0,
+        n_pre=1,
+        n_main=1,
+        eps_f=0.05,
+        t_mem="all",
+        mix_ratio=[3, 1],
+        m_max_total=100,
+        m_max_per_class=10,
+        ewc_lambda=10.0,
+        ewc_topk=8,
+        ewc_iters=10,
+        enable_ciba=False,
+        enable_ctr=True,
+        enable_spectral_ogp=True,
+        enable_sacr=True,
+        lambda_old_kd=1.5,
+        lambda_old_clip=0.3,
+        lambda_unseen_clip=0.25,
+    )
+
+    trainer.run()
+
+    overrides = calls[0]["extra_overrides"]
+    assert overrides[overrides.index("MODEL.COVL.ENABLE_CIBA") + 1] == "False"
+    assert overrides[overrides.index("MODEL.COVL.ENABLE_CTR") + 1] == "True"
+    assert overrides[overrides.index("MODEL.COVL.ENABLE_OGP") + 1] == "True"
+    assert overrides[overrides.index("MODEL.SEM_SEG_HEAD.LAMBDA_OLD_KD") + 1] == "1.5"
+    assert overrides[overrides.index("MODEL.SEM_SEG_HEAD.LAMBDA_OLD_CLIP") + 1] == "0.3"
+    assert overrides[overrides.index("MODEL.SEM_SEG_HEAD.LAMBDA_UNSEEN_CLIP") + 1] == "0.25"
+
+
 def test_trainer_d2_logs_real_source_derived_continual_record(tmp_path, monkeypatch):
     cfg = _write_mock_config(tmp_path)
     class_names = [f"class_{idx}" for idx in range(150)]
