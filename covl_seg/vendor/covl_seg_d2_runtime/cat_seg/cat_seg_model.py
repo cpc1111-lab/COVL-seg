@@ -22,7 +22,10 @@ from covl_seg.losses.ciba import ciba_alignment_loss
 from covl_seg.losses.ctr import ctr_background_loss
 from covl_seg.losses.mine import MINECritic, mine_lower_bound
 
-from .continual_losses import kd_loss_on_class_indexes
+from .continual_losses import (
+    clip_alignment_loss_on_class_indexes,
+    kd_loss_on_class_indexes,
+)
 from .utils.class_masking import (
     load_visible_class_indexes,
     mask_logits_and_targets_to_visible_classes,
@@ -49,9 +52,12 @@ class CATSeg(nn.Module):
         test_class_json: str,
         train_class_indexes: str,
         train_old_class_indexes: str,
+        train_unseen_class_indexes: str,
         old_teacher_weights: str,
         distill_temp: float,
         lambda_old_kd: float,
+        lambda_old_clip: float,
+        lambda_unseen_clip: float,
         enable_ciba: bool = False,
         enable_ctr: bool = False,
         beta_star: float = 0.0,
@@ -89,12 +95,19 @@ class CATSeg(nn.Module):
             path_value=train_old_class_indexes,
             num_classes=int(self.sem_seg_head.num_classes),
         )
+        unseen_indexes = load_visible_class_indexes(
+            path_value=train_unseen_class_indexes,
+            num_classes=int(self.sem_seg_head.num_classes),
+        )
         self.visible_class_indexes = visible_indexes
         self.train_class_indexes = [] if visible_indexes is None else visible_indexes.tolist()
         self.old_class_indexes = [] if old_indexes is None else old_indexes.tolist()
+        self.unseen_class_indexes = [] if unseen_indexes is None else unseen_indexes.tolist()
         self.old_teacher_weights = old_teacher_weights
         self.distill_temp = float(distill_temp)
         self.lambda_old_kd = float(lambda_old_kd)
+        self.lambda_old_clip = float(lambda_old_clip)
+        self.lambda_unseen_clip = float(lambda_unseen_clip)
         self._old_teacher: Optional[nn.Module] = None
         self._old_teacher_load_attempted = False
 
@@ -156,9 +169,16 @@ class CATSeg(nn.Module):
             "test_class_json": cfg.MODEL.SEM_SEG_HEAD.TEST_CLASS_JSON,
             "train_class_indexes": cfg.MODEL.SEM_SEG_HEAD.TRAIN_CLASS_INDEXES,
             "train_old_class_indexes": cfg.MODEL.SEM_SEG_HEAD.TRAIN_OLD_CLASS_INDEXES,
+            "train_unseen_class_indexes": getattr(
+                cfg.MODEL.SEM_SEG_HEAD,
+                "TRAIN_UNSEEN_CLASS_INDEXES",
+                "",
+            ),
             "old_teacher_weights": cfg.MODEL.SEM_SEG_HEAD.OLD_TEACHER_WEIGHTS,
             "distill_temp": cfg.MODEL.SEM_SEG_HEAD.DISTILL_TEMP,
             "lambda_old_kd": cfg.MODEL.SEM_SEG_HEAD.LAMBDA_OLD_KD,
+            "lambda_old_clip": getattr(cfg.MODEL.SEM_SEG_HEAD, "LAMBDA_OLD_CLIP", 0.0),
+            "lambda_unseen_clip": getattr(cfg.MODEL.SEM_SEG_HEAD, "LAMBDA_UNSEEN_CLIP", 0.0),
             "enable_ciba": cfg.MODEL.COVL.ENABLE_CIBA,
             "enable_ctr": cfg.MODEL.COVL.ENABLE_CTR,
             "beta_star": getattr(cfg.MODEL.COVL, "BETA_STAR", 0.0),
@@ -356,6 +376,32 @@ class CATSeg(nn.Module):
                     class_indexes=self.old_class_indexes,
                     temperature=self.distill_temp,
                 )
+
+            try:
+                text_features = self._get_text_features()
+            except AttributeError:
+                text_features = None
+
+            if text_features is not None:
+                pooled_res3 = res3.mean(dim=(2, 3))
+                pixel_res3 = res3.movedim(1, -1).reshape(-1, res3.shape[1])
+                visual_features = torch.cat((pixel_res3, pooled_res3), dim=0)
+
+                if self.old_class_indexes and self.lambda_old_clip > 0:
+                    losses["loss_old_clip"] = self.lambda_old_clip * clip_alignment_loss_on_class_indexes(
+                        visual_features=visual_features,
+                        text_features=text_features,
+                        class_indexes=self.old_class_indexes,
+                        scale=self.distill_temp,
+                    )
+
+                if self.unseen_class_indexes and self.lambda_unseen_clip > 0:
+                    losses["loss_unseen_clip"] = self.lambda_unseen_clip * clip_alignment_loss_on_class_indexes(
+                        visual_features=visual_features,
+                        text_features=text_features,
+                        class_indexes=self.unseen_class_indexes,
+                        scale=self.distill_temp,
+                    )
             return losses
 
         else:

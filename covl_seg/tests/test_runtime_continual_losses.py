@@ -152,7 +152,10 @@ def _build_runtime_training_model(module):
 
     model.visible_class_indexes = None
     model.old_class_indexes = []
+    model.unseen_class_indexes = []
     model.lambda_old_kd = 0.0
+    model.lambda_old_clip = 0.0
+    model.lambda_unseen_clip = 0.0
     model.distill_temp = 1.0
     model.enable_ciba = False
     model.enable_ctr = False
@@ -272,11 +275,47 @@ def test_kd_loss_on_class_indexes_returns_zero_for_empty_indexes():
     assert float(loss.item()) == 0.0
 
 
+def test_clip_alignment_loss_on_class_indexes_is_finite_and_non_negative_for_valid_indexes():
+    module = _load_runtime_continual_losses_module()
+
+    visual_features = torch.randn(2, 4, 3, 3)
+    text_features = torch.randn(6, 4)
+    class_indexes = [0, 3, 5]
+
+    loss = module.clip_alignment_loss_on_class_indexes(
+        visual_features=visual_features,
+        text_features=text_features,
+        class_indexes=class_indexes,
+        scale=2.0,
+    )
+
+    assert torch.isfinite(loss)
+    assert float(loss.item()) >= 0.0
+
+
+def test_clip_alignment_loss_on_class_indexes_returns_zero_for_empty_indexes():
+    module = _load_runtime_continual_losses_module()
+
+    visual_features = torch.randn(1, 4, 2, 2)
+    text_features = torch.randn(5, 4)
+
+    loss = module.clip_alignment_loss_on_class_indexes(
+        visual_features=visual_features,
+        text_features=text_features,
+        class_indexes=[],
+        scale=1.0,
+    )
+
+    assert float(loss.item()) == 0.0
+
+
 def test_continual_losses_module_exposes_kd_api():
     module = _load_runtime_continual_losses_module()
 
     assert hasattr(module, "kd_loss_on_class_indexes")
     assert callable(module.kd_loss_on_class_indexes)
+    assert hasattr(module, "clip_alignment_loss_on_class_indexes")
+    assert callable(module.clip_alignment_loss_on_class_indexes)
 
 
 def test_cat_seg_training_skips_old_kd_without_teacher_or_old_indexes(monkeypatch):

@@ -53,3 +53,46 @@ def kd_loss_on_class_indexes(
     teacher_probs = F.softmax(scaled_teacher, dim=1)
     loss = F.kl_div(student_log_probs, teacher_probs, reduction="batchmean")
     return loss * (temperature ** 2)
+
+
+def clip_alignment_loss_on_class_indexes(
+    visual_features: torch.Tensor,
+    text_features: torch.Tensor,
+    class_indexes: object,
+    scale: float,
+) -> torch.Tensor:
+    device = visual_features.device
+    indexes = _as_index_tensor(class_indexes, device=device)
+    if indexes.numel() == 0:
+        return zero_loss(device)
+    if visual_features.numel() == 0 or text_features.numel() == 0:
+        return zero_loss(device)
+
+    valid = (indexes >= 0) & (indexes < text_features.shape[0])
+    indexes = indexes[valid]
+    if indexes.numel() == 0:
+        return zero_loss(device)
+
+    visual = visual_features
+    if visual.dim() == 4:
+        visual = visual.movedim(1, -1).reshape(-1, visual.shape[1])
+    elif visual.dim() == 2:
+        pass
+    else:
+        visual = visual.reshape(-1, visual.shape[-1])
+    if visual.shape[0] == 0:
+        return zero_loss(device)
+
+    text = text_features.index_select(0, indexes.to(text_features.device)).to(device)
+
+    visual = F.normalize(visual.float(), dim=-1)
+    text = F.normalize(text.float(), dim=-1)
+
+    safe_scale = float(scale)
+    if not torch.isfinite(torch.tensor(safe_scale)) or safe_scale <= 0:
+        safe_scale = 1.0
+
+    similarity = safe_scale * (visual @ text.transpose(0, 1))
+    loss = F.softplus(-similarity).mean()
+    loss = torch.nan_to_num(loss, nan=0.0, posinf=1e4, neginf=0.0)
+    return loss.clamp_min(0.0)
