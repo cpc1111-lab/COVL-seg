@@ -5,11 +5,12 @@ import logging
 import math
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional
 
 import torch
+from torch import nn
 from tqdm.auto import tqdm
 
 _log = logging.getLogger(__name__)
@@ -22,6 +23,7 @@ from covl_seg.engine.balanced_controller import (
     update_controller_state,
 )
 from covl_seg.engine.detectron2_runner import (
+    build_covl_training_model,
     _d2_project_root,
     _resolve_experiment_spec,
     _resolve_class_names,
@@ -31,6 +33,7 @@ from covl_seg.engine.detectron2_runner import (
 )
 from covl_seg.engine.hooks import append_metrics_jsonl
 from covl_seg.engine.mock_continual_runner import infer_num_classes_from_config as _infer_num_classes_from_config_mock
+from covl_seg.engine.mock_training_loop import run_mock_task_training
 from covl_seg.engine.phase_runner import (
     run_phase1_hciba,
     run_phase2_joint,
@@ -451,6 +454,7 @@ class OpenContinualTrainer:
     lambda_old_clip: float = 0.1
     lambda_unseen_clip: float = 0.2
     resume_task: int = 0
+    _mock_model: Optional[nn.Module] = field(default=None, init=False, repr=False)
 
     @classmethod
     def from_args(cls, args) -> "OpenContinualTrainer":
@@ -562,12 +566,33 @@ class OpenContinualTrainer:
                 raise ValueError(
                     "D2 resume requires a prior model artifact, but no continual state was found."
                 )
+            if self.engine == "mock" and self.resume_task > 0:
+                raise ValueError(
+                    "Mock resume requires prior continual state, but no continual state was found."
+                )
             return
         prior_method = state.get("method")
         if prior_method is not None and prior_method != self.method_name:
             raise ValueError(
                 f"Resume method mismatch: existing={prior_method}, requested={self.method_name}"
             )
+        if self.engine == "mock" and self.resume_task > 0:
+            prior_mock_model_path = state.get("latest_mock_model_path") or state.get("latest_model_path")
+            if not prior_mock_model_path:
+                raise ValueError(
+                    "Mock resume requires a valid mock model artifact path in continual state "
+                    f"for resume_task={self.resume_task}."
+                )
+            prior_path = Path(str(prior_mock_model_path))
+            if not prior_path.is_absolute():
+                prior_path = (self.output_dir / prior_path).resolve()
+            if not prior_path.exists() or not prior_path.is_file():
+                raise ValueError(
+                    "Mock resume requires a valid mock model artifact at "
+                    f"{prior_path} for resume_task={self.resume_task}."
+                )
+            return
+
         if self.engine != "d2" or self.resume_task <= 0:
             return
         prior_weight_path = _resolve_prior_task_weight_path(
@@ -640,6 +665,35 @@ class OpenContinualTrainer:
         }
         clip_overrides = _clip_overrides(self.clip_finetune)
         class_names = _resolve_task_class_names(self.config_path) if self.engine == "d2" else None
+        if self.engine == "mock" and self._mock_model is None:
+            all_task_classes = [
+                c
+                for task in plan.tasks
+                for c in (task.seen_classes + task.new_classes + task.background_classes)
+            ]
+            num_classes = max(all_task_classes, default=-1) + 1
+            self._mock_model = build_covl_training_model(
+                num_classes=max(1, num_classes),
+                seed=self.seed,
+            )
+            prior_mock_model_path = state.get("latest_mock_model_path") or state.get("latest_model_path")
+            if self.resume_task > 0:
+                if not prior_mock_model_path:
+                    raise ValueError(
+                        "Mock resume requires a valid mock model artifact path in continual state "
+                        f"for resume_task={self.resume_task}."
+                    )
+                prior_path = Path(str(prior_mock_model_path))
+                if not prior_path.is_absolute():
+                    prior_path = (self.output_dir / prior_path).resolve()
+                if not prior_path.exists() or not prior_path.is_file():
+                    raise ValueError(
+                        "Mock resume requires a valid mock model artifact at "
+                        f"{prior_path} for resume_task={self.resume_task}."
+                    )
+                prior_payload = torch.load(prior_path, map_location="cpu")
+                model_state_dict = prior_payload.get("model_state_dict", prior_payload)
+                self._mock_model.load_state_dict(model_state_dict)
 
         completed = 0
         for task in plan.tasks:
@@ -678,11 +732,23 @@ class OpenContinualTrainer:
                 }
             phase_cfg = {**task_cfg, **method_phase_cfg, **balanced_knobs, "n_main": task_main_iters}
             batch = _build_phase_batch(task)
-
-            p1 = run_phase1_hciba(task.task_id, phase_cfg, batch=batch)
-            p2 = run_phase2_joint(task.task_id, phase_cfg, batch=batch)
-            p3 = run_phase3_subspace_and_fusion(task.task_id, phase_cfg, batch=batch, prev_phase_metrics=p1)
-            p4 = run_phase4_replay_update(task.task_id, phase_cfg, batch=batch)
+            if self.engine == "mock":
+                assert self._mock_model is not None
+                self._mock_model, phase_metrics = run_mock_task_training(
+                    model=self._mock_model,
+                    task=task,
+                    cfg=phase_cfg,
+                    basis_history=[torch.tensor(b, dtype=torch.float32) for b in basis_history],
+                )
+                p1 = dict(phase_metrics["phase1"])
+                p2 = dict(phase_metrics["phase2"])
+                p3 = dict(phase_metrics["phase3"])
+                p4 = dict(phase_metrics["phase4"])
+            else:
+                p1 = run_phase1_hciba(task.task_id, phase_cfg, batch=batch)
+                p2 = run_phase2_joint(task.task_id, phase_cfg, batch=batch)
+                p3 = run_phase3_subspace_and_fusion(task.task_id, phase_cfg, batch=batch, prev_phase_metrics=p1)
+                p4 = run_phase4_replay_update(task.task_id, phase_cfg, batch=batch)
 
             current_basis = p3.get("subspace_basis", [])
             p3["omega_tau_t"] = float(_compute_omega_tau_t(current_basis, basis_history))
@@ -936,8 +1002,10 @@ class OpenContinualTrainer:
                     )
             else:
                 for record in (p1, p2, p3, p4):
-                    record["proxy_source"] = "synthetic"
-                    append_metrics_jsonl(self._metrics_path(), record)
+                    mock_record = dict(record)
+                    mock_record["proxy_source"] = "mock_training_loop"
+                    mock_record["engine"] = "mock"
+                    append_metrics_jsonl(self._metrics_path(), mock_record)
 
             if balanced_enabled:
                 current_eval = {
@@ -1003,8 +1071,27 @@ class OpenContinualTrainer:
             if current_basis:
                 basis_history.append(current_basis)
             latest_model_path = state.get("latest_model_path")
+            latest_mock_model_path = state.get("latest_mock_model_path")
             if self.engine == "d2":
                 latest_model_path = str(task_dir / "model_final.pth")
+            elif self.engine == "mock":
+                assert self._mock_model is not None
+                task_dir.mkdir(parents=True, exist_ok=True)
+                mock_model_path = (task_dir / "mock_model.pt").resolve()
+                torch.save({"model_state_dict": self._mock_model.state_dict()}, mock_model_path)
+                latest_mock_model_path = str(mock_model_path)
+                latest_model_path = latest_mock_model_path
+                self._write_json(
+                    self.output_dir / f"checkpoint_task_{task.task_id:03d}.json",
+                    {
+                        "config": self.config_path,
+                        "seed": self.seed,
+                        "resume_task": task.task_id - 1,
+                        "last_task": task.task_id,
+                        "engine": "mock",
+                        "mock_model_path": latest_mock_model_path,
+                    },
+                )
             state = {
                 "current_task": task.task_id,
                 "method": method.name,
@@ -1019,6 +1106,8 @@ class OpenContinualTrainer:
                 "last_task_dir": str(task_dir),
                 "latest_model_path": latest_model_path,
             }
+            if latest_mock_model_path is not None:
+                state["latest_mock_model_path"] = latest_mock_model_path
             if balanced_enabled:
                 state["balanced_controller"] = {
                     "alpha_floor": _safe_float(balanced_state.alpha_floor),

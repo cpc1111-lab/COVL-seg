@@ -57,6 +57,7 @@ class COVLSegModel(nn.Module):
 
         outputs: Dict[str, torch.Tensor] = {
             "logits": logits,
+            "projected": projected,
             "boundary_map": boundary_map,
         }
         if targets is not None:

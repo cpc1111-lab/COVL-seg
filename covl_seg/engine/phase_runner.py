@@ -10,7 +10,11 @@ from covl_seg.continual.fisher import fisher_matvec_from_gradients, top_eigenvec
 from covl_seg.continual.replay_buffer import ReplayItem, SACRReplayBuffer
 from covl_seg.continual.spectral_ogp import hard_project_gradient
 from covl_seg.losses.ciba import estimate_beta_star
-from covl_seg.losses.mine import MINECritic, mine_loss, mine_lower_bound
+from covl_seg.losses.mine import (
+    ConditionalMINECritic,
+    conditional_mine_loss,
+    conditional_mine_lower_bound,
+)
 
 
 def _deterministic_loss(task_id: int, salt: int) -> float:
@@ -27,36 +31,42 @@ def _to_tensor(values, fallback: torch.Tensor) -> torch.Tensor:
     return tensor
 
 
-def _quick_mine_estimate(x: torch.Tensor, y: torch.Tensor, n_steps: int = 8) -> float:
-    """Estimate MINE lower bound I(x; y) with a small critic trained from scratch.
+def _quick_conditional_mine_estimate(
+    x: torch.Tensor,
+    y: torch.Tensor,
+    z_cond: torch.Tensor,
+    n_steps: int = 8,
+) -> float:
+    """Estimate conditional MINE lower bound I(x; y | z_cond) with a small critic.
 
-    Both x and y are treated as 1-D feature streams (N samples, 1 feature each).
+    Inputs are treated as 1-D feature streams (N samples, 1 feature each).
     Returns a non-negative float clamped at 0.  Returns 0.0 for degenerate inputs
     (fewer than 2 samples or zero-variance streams) to avoid NaN in downstream formulas.
     """
     x = x.reshape(-1, 1).float()
     y = y.reshape(-1, 1).float()
-    n = min(x.shape[0], y.shape[0])
+    z_cond = z_cond.reshape(-1, 1).float()
+    n = min(x.shape[0], y.shape[0], z_cond.shape[0])
     if n < 2:
         return 0.0
-    x, y = x[:n], y[:n]
+    x, y, z_cond = x[:n], y[:n], z_cond[:n]
 
     # Skip training if either stream is constant — MINE would produce NaN
     if float(x.var().item()) < 1e-9 or float(y.var().item()) < 1e-9:
         return 0.0
 
-    critic = MINECritic(feature_dim=1, hidden_dim=16)
+    critic = ConditionalMINECritic(feature_dim=1, hidden_dim=16)
     opt = torch.optim.Adam(critic.parameters(), lr=1e-2)
     for _ in range(n_steps):
         opt.zero_grad()
-        loss = mine_loss(critic, x, y)
+        loss = conditional_mine_loss(critic, x, y, z_cond)
         if not torch.isfinite(loss):
             break
         loss.backward()
         opt.step()
 
     with torch.no_grad():
-        result = mine_lower_bound(critic, x, y)
+        result = conditional_mine_lower_bound(critic, x, y, z_cond)
         if not torch.isfinite(result):
             return 0.0
         return float(result.clamp(min=0.0).item())
@@ -82,10 +92,8 @@ def run_phase1_hciba(
     z_s = z_s.reshape(-1)[:min_len]
     y = y.reshape(-1)[:min_len]
 
-    # I_exc^C = I(Z_C ; Y | Z_S) proxy ≈ I(Z_C ; Y) estimated via MINE
-    # I_exc^S = I(Z_S ; Y | Z_C) proxy ≈ I(Z_S ; Y) estimated via MINE
-    i_exc_c = _quick_mine_estimate(z_c, y)
-    i_exc_s = _quick_mine_estimate(z_s, y)
+    i_exc_c = _quick_conditional_mine_estimate(z_c, y, z_cond=z_s)
+    i_exc_s = _quick_conditional_mine_estimate(z_s, y, z_cond=z_c)
 
     # Δ_S^C = I_exc^S − I_exc^C  (positive when backbone has more exclusive info)
     delta = max(0.0, i_exc_s - i_exc_c)

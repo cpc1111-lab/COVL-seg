@@ -30,7 +30,9 @@ def test_covl_seg_model_forward_shape():
 
     outputs = model(images=images, text_embeddings=text_embeddings, clip_logits=clip_logits)
     assert "logits" in outputs
+    assert "projected" in outputs
     assert outputs["logits"].shape == (2, 5, 48, 48)
+    assert outputs["projected"].shape == (2, 16, 48, 48)
     assert outputs["boundary_map"].shape == (2, 1, 48, 48)
 
 
@@ -53,3 +55,24 @@ def test_backward_no_nan():
         ]
     ).sum()
     assert torch.isfinite(grad_norm)
+
+
+def test_fusion_boundary_boost_reduces_clip_weight_at_boundaries():
+    from covl_seg.model.fusion import FusionHead
+
+    fusion = FusionHead(alpha=0.6, tau=1.0, boundary_boost=0.2)
+
+    seg_logits = torch.tensor([[[[0.0]], [[2.0]]]])
+    clip_logits = torch.tensor([[[[3.0]], [[0.0]]]])
+    interior_boundary_map = torch.zeros(1, 1, 1, 1)
+    edge_boundary_map = torch.ones(1, 1, 1, 1)
+
+    interior = fusion(seg_logits, clip_logits, interior_boundary_map)
+    edge = fusion(seg_logits, clip_logits, edge_boundary_map)
+
+    seg_log_prob = torch.nn.functional.log_softmax(seg_logits, dim=1)
+    clip_log_prob = torch.nn.functional.log_softmax(clip_logits, dim=1)
+    expected_edge = 0.4 * clip_log_prob + 0.6 * seg_log_prob
+
+    assert torch.allclose(edge, expected_edge)
+    assert edge[0, 0, 0, 0] < interior[0, 0, 0, 0]
