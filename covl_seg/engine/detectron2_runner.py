@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import math
 import os
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -88,6 +90,37 @@ _SEG_NET_TO_CONFIG = {
 }
 
 
+_EXPERIMENT_SPECS: Dict[str, Dict[str, str]] = {
+    "coco": {
+        "alias": "coco",
+        "class_json": "datasets/coco.json",
+        "dataset_name": "coco_2017_test_stuff_all_sem_seg",
+        "num_classes": "164",
+    },
+    "ade150": {
+        "alias": "ade150",
+        "class_json": "datasets/ade150.json",
+        "dataset_name": "ade20k_150_test_sem_seg",
+        "num_classes": "150",
+    },
+}
+
+
+def _match_dataset_family(value: str) -> Optional[str]:
+    lowered = value.lower()
+    matches = []
+
+    if re.search(r"(^|[^a-z0-9])coco([^a-z0-9]|$)", lowered):
+        matches.append("coco")
+    if re.search(r"(^|[^a-z0-9])ade(?:20k|15|100|150)?([^a-z0-9]|$)", lowered):
+        matches.append("ade150")
+    if len(matches) > 1:
+        raise ValueError(f"Ambiguous dataset family in '{value}'")
+    if matches:
+        return matches[0]
+    return None
+
+
 def _infer_seg_network(config_path: str) -> str:
     lowered = config_path.lower()
     if "vitl" in lowered:
@@ -103,33 +136,45 @@ def _infer_seg_network(config_path: str) -> str:
     return "vitb"
 
 
-def _select_base_eval_spec(config_path: str) -> Dict[str, str]:
-    lowered = config_path.lower()
+def _read_covl_config_text(config_path: str) -> str:
     candidate = Path(config_path)
     if candidate.exists():
         try:
-            lowered = f"{lowered}\n{candidate.read_text(encoding='utf-8').lower()}"
+            return candidate.read_text(encoding="utf-8")
         except OSError:
-            pass
-    else:
-        workspace_candidate = (_workspace_root() / config_path).resolve()
-        if workspace_candidate.exists():
-            try:
-                lowered = f"{lowered}\n{workspace_candidate.read_text(encoding='utf-8').lower()}"
-            except OSError:
-                pass
+            return ""
 
-    if "coco" in lowered:
-        return {
-            "alias": "coco",
-            "class_json": "datasets/coco.json",
-            "dataset_name": "coco_2017_test_stuff_all_sem_seg",
-        }
+    workspace_candidate = (_workspace_root() / config_path).resolve()
+    if workspace_candidate.exists():
+        try:
+            return workspace_candidate.read_text(encoding="utf-8")
+        except OSError:
+            return ""
+    return ""
 
+
+def _resolve_experiment_spec(config_path: str) -> Dict[str, str]:
+    config_text = _read_covl_config_text(config_path)
+    dataset_match = re.search(r"^\s*DATASET\s*:\s*([^\s#]+)", config_text, flags=re.MULTILINE)
+    if dataset_match is not None:
+        dataset_name = dataset_match.group(1).strip().lower()
+        config_family = _match_dataset_family(dataset_name)
+        if config_family is None:
+            raise ValueError(f"Unsupported dataset family in '{dataset_name}'")
+        return dict(_EXPERIMENT_SPECS[config_family])
+
+    path_family = _match_dataset_family(config_path)
+    if path_family is None:
+        raise ValueError(f"Unsupported dataset family for '{config_path}'")
+    return dict(_EXPERIMENT_SPECS[path_family])
+
+
+def _select_base_eval_spec(config_path: str) -> Dict[str, str]:
+    spec = _resolve_experiment_spec(config_path)
     return {
-        "alias": "ade150",
-        "class_json": "datasets/ade150.json",
-        "dataset_name": "ade20k_150_test_sem_seg",
+        "alias": spec["alias"],
+        "class_json": spec["class_json"],
+        "dataset_name": spec["dataset_name"],
     }
 
 
@@ -171,6 +216,7 @@ def _run_d2_command_stream(
     env: Dict[str, str],
     on_output: Callable[[str], None],
 ) -> None:
+    tail: List[str] = []
     process = subprocess.Popen(
         cmd,
         cwd=str(cwd),
@@ -184,13 +230,20 @@ def _run_d2_command_stream(
         raise RuntimeError("Failed to stream Detectron2 command output")
 
     for line in process.stdout:
-        on_output(line.rstrip("\n"))
+        text = line.rstrip("\n")
+        tail.append(text)
+        if len(tail) > 40:
+            tail.pop(0)
+        on_output(text)
 
     rc = process.wait()
     if rc != 0:
+        details = ""
+        if tail:
+            details = "\noutput tail:\n" + "\n".join(tail)
         raise RuntimeError(
             "Detectron2 command failed with exit code "
-            f"{rc}: {' '.join(cmd)}"
+            f"{rc}: {' '.join(cmd)}{details}"
         )
 
 
@@ -379,9 +432,10 @@ def _resolve_class_names(project_root: Path, class_json: str) -> List[str]:
 
 
 def _avg(values: List[float]) -> Optional[float]:
-    if not values:
+    finite = [float(v) for v in values if math.isfinite(float(v))]
+    if not finite:
         return None
-    return float(sum(values) / len(values))
+    return float(sum(finite) / len(finite))
 
 
 def _derive_split_metrics(
@@ -395,7 +449,7 @@ def _derive_split_metrics(
     seen_indexes = _read_index_list(splits_dir / "seen_indexes.json")
     new_indexes = _read_index_list(splits_dir / "new_indexes.json")
     bg_indexes = _read_index_list(splits_dir / "unseen_indexes.json")
-    if not seen_indexes or not new_indexes or not bg_indexes:
+    if not seen_indexes or not new_indexes:
         return {}
 
     class_names = _resolve_class_names(project_root=project_root, class_json=class_json)
@@ -414,7 +468,10 @@ def _derive_split_metrics(
             value = sem_seg.get(key)
             if value is None:
                 continue
-            values.append(float(value))
+            value_f = float(value)
+            if not math.isfinite(value_f):
+                continue
+            values.append(value_f)
         return values
 
     derived: Dict[str, Any] = {}
@@ -441,6 +498,8 @@ def _derive_split_metrics(
             continue
         class_name = key[4:]
         score = float(value)
+        if not math.isfinite(score):
+            continue
         class_iou_all[class_name] = score
         if class_name in old_name_set:
             class_iou_old[class_name] = score
@@ -475,7 +534,9 @@ def _extract_eval_metrics(
         for key in keys:
             value = sem_seg.get(key)
             if value is not None:
-                return float(value)
+                value_f = float(value)
+                if math.isfinite(value_f):
+                    return value_f
         return None
 
     all_miou = _pick("mIoU")
@@ -711,6 +772,13 @@ def _extract_train_records(output_dir: Path, resume_task: int, num_tasks: int) -
     return num_records
 
 
+def _lookup_override_value(overrides: List[str], key: str) -> Optional[str]:
+    for idx in range(len(overrides) - 2, -1, -2):
+        if overrides[idx] == key:
+            return overrides[idx + 1]
+    return None
+
+
 def run_detectron2_train(
     config_path: str,
     output_dir: Path,
@@ -730,8 +798,13 @@ def run_detectron2_train(
     project_root = _d2_project_root()
     entrypoint = _d2_entrypoint()
     resolved_config = _resolve_d2_config(config_path, project_root=project_root, seg_network=seg_network)
+    explicit_overrides = list(extra_overrides or [])
+    if resume_task > 0 and _lookup_override_value(explicit_overrides, "MODEL.WEIGHTS") is None:
+        raise RuntimeError(
+            "Detectron2 training with resume_task > 0 requires explicit MODEL.WEIGHTS in extra_overrides."
+        )
 
-    cmd = [
+    base_cmd = [
         "python",
         entrypoint,
         "--config-file",
@@ -745,14 +818,14 @@ def run_detectron2_train(
         str(output_dir),
         "SEED",
         str(seed),
-    ] + _default_stable_train_overrides()
-    if extra_overrides:
-        cmd.extend(extra_overrides)
+    ]
+    default_overrides = _default_stable_train_overrides()
+    cmd = base_cmd + default_overrides + explicit_overrides
     force_low_mem = os.environ.get("COVL_SEG_D2_FORCE_LOW_MEM", "0") == "1"
     if force_low_mem:
         last_exc: Optional[RuntimeError] = None
         for idx, profile in enumerate(_low_mem_override_profiles(), start=1):
-            attempt_cmd = cmd + profile
+            attempt_cmd = base_cmd + profile + explicit_overrides
             try:
                 _run_d2_command(cmd=attempt_cmd, cwd=project_root, on_output=progress_callback)
                 break
@@ -769,7 +842,7 @@ def run_detectron2_train(
             if _is_cuda_oom_error(exc):
                 last_exc = exc
                 for idx, profile in enumerate(_low_mem_override_profiles(), start=1):
-                    retry_cmd = cmd + profile
+                    retry_cmd = base_cmd + profile + explicit_overrides
                     try:
                         _run_d2_command(cmd=retry_cmd, cwd=project_root, on_output=progress_callback)
                         break
@@ -782,7 +855,7 @@ def run_detectron2_train(
             elif _is_nan_loss_error(exc):
                 last_exc = exc
                 for idx, profile in enumerate(_stability_override_profiles(), start=1):
-                    retry_cmd = cmd + profile
+                    retry_cmd = base_cmd + profile + explicit_overrides
                     try:
                         _run_d2_command(cmd=retry_cmd, cwd=project_root, on_output=progress_callback)
                         break
@@ -813,6 +886,9 @@ def run_detectron2_train(
         "engine": "d2",
         "backend": "d2_train_entrypoint",
     }
+    loaded_weights = _lookup_override_value(explicit_overrides, "MODEL.WEIGHTS")
+    if loaded_weights is not None:
+        checkpoint_payload["loaded_weights"] = loaded_weights
     ckpt = output_dir / f"checkpoint_task_{last_task:03d}.json"
     ckpt.write_text(json.dumps(checkpoint_payload, indent=2), encoding="utf-8")
     return {
@@ -859,10 +935,10 @@ def run_detectron2_eval(
     miou = base_metrics.get("mIoU_all")
 
     payload: Dict[str, Any] = {
-        "mIoU_all": float("nan") if miou is None else miou,
-        "mIoU_old": float("nan"),
-        "mIoU_new": float("nan"),
-        "BG-mIoU": float("nan"),
+        "mIoU_all": None if miou is None else float(miou),
+        "mIoU_old": None,
+        "mIoU_new": None,
+        "BG-mIoU": None,
         "resume_task": float(resume_task),
         "engine": "d2",
     }
@@ -887,7 +963,8 @@ def run_detectron2_eval(
                 eval_max_samples=eval_max_samples,
                 progress_callback=progress_callback,
             )
-            payload[f"ov_mIoU_{alias}"] = metrics.get("mIoU_all", float("nan"))
+            ov_value = metrics.get("mIoU_all")
+            payload[f"ov_mIoU_{alias}"] = None if ov_value is None else float(ov_value)
 
     payload["checkpoint"] = str(weights)
     payload["config"] = str(resolved_config)

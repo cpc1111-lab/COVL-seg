@@ -41,12 +41,16 @@ def test_run_detectron2_train_invokes_catseg_train_net(monkeypatch, tmp_path: Pa
         encoding="utf-8",
     )
 
+    prior_weights = tmp_path / "task_001_model_final.pth"
+    prior_weights.write_text("stub", encoding="utf-8")
+
     result = d2_runner.run_detectron2_train(
         config_path="covl_seg/configs/covl_seg_vitb_ade15.yaml",
         output_dir=out_dir,
         seed=3,
         resume_task=1,
         max_tasks=2,
+        extra_overrides=["MODEL.WEIGHTS", str(prior_weights)],
     )
 
     assert result["num_tasks"] == 2
@@ -65,6 +69,8 @@ def test_run_detectron2_train_invokes_catseg_train_net(monkeypatch, tmp_path: Pa
     assert cmd[cmd.index("SOLVER.AMP.ENABLED") + 1] == "False"
     assert "SOLVER.BASE_LR" in cmd
     assert cmd[cmd.index("SOLVER.BASE_LR") + 1] == "0.0001"
+    assert "MODEL.WEIGHTS" in cmd
+    assert cmd[cmd.index("MODEL.WEIGHTS") + 1] == str(prior_weights)
     assert calls[0]["env"]["DETECTRON2_DATASETS"] == str(d2_runner._workspace_root() / "datasets")
     metrics_lines = (out_dir / "metrics.jsonl").read_text(encoding="utf-8").strip().splitlines()
     assert len(metrics_lines) == 2
@@ -189,7 +195,9 @@ def test_run_detectron2_eval_uses_coco_dataset_for_coco_config(monkeypatch, tmp_
     cmd = calls[0]
     assert '("coco_2017_test_stuff_all_sem_seg",)' in cmd
     assert "MODEL.SEM_SEG_HEAD.TEST_CLASS_JSON" in cmd
-    assert cmd[cmd.index("MODEL.SEM_SEG_HEAD.TEST_CLASS_JSON") + 1] == "datasets/coco.json"
+    test_class_json = cmd[cmd.index("MODEL.SEM_SEG_HEAD.TEST_CLASS_JSON") + 1]
+    assert test_class_json.endswith("coco.json")
+    assert "ade" not in test_class_json.lower()
     assert payload["mIoU_all"] == 41.5
 
 
@@ -239,6 +247,98 @@ def test_run_detectron2_eval_derives_old_new_bg_metrics_from_task_splits(monkeyp
     assert payload["class_iou_old"] == {"person": 50.0}
     assert payload["class_iou_new"] == {"bicycle": 30.0}
     assert payload["class_iou_bg"] == {"car": 10.0}
+
+
+def test_run_detectron2_eval_derives_old_new_even_when_bg_split_empty(monkeypatch, tmp_path: Path):
+    from covl_seg.engine import detectron2_runner as d2_runner
+
+    def _fake_run(cmd, cwd, check, env, **_kwargs):
+        output_dir = Path(cmd[cmd.index("OUTPUT_DIR") + 1])
+        inference_dir = output_dir / "inference"
+        inference_dir.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "sem_seg": {
+                "mIoU": 30.0,
+                "IoU-person": 50.0,
+                "IoU-bicycle": 30.0,
+            }
+        }
+        torch.save(payload, inference_dir / "sem_seg_evaluation.pth")
+
+        class _Completed:
+            stdout = ""
+            stderr = ""
+
+        return _Completed()
+
+    splits = tmp_path / "eval_with_empty_bg" / "splits"
+    splits.mkdir(parents=True, exist_ok=True)
+    (splits / "seen_indexes.json").write_text("[0, 1]", encoding="utf-8")
+    (splits / "new_indexes.json").write_text("[1]", encoding="utf-8")
+    (splits / "unseen_indexes.json").write_text("[]", encoding="utf-8")
+
+    monkeypatch.setattr(d2_runner, "detectron2_available", lambda: True)
+    monkeypatch.setattr(d2_runner.subprocess, "run", _fake_run)
+
+    payload = d2_runner.run_detectron2_eval(
+        config_path="covl_seg/configs/covl_seg_vitb_coco.yaml",
+        output_dir=tmp_path / "eval_with_empty_bg",
+        resume_task=1,
+        checkpoint="/tmp/model_final.pth",
+        open_vocab=False,
+    )
+
+    assert payload["mIoU_old"] == 50.0
+    assert payload["mIoU_new"] == 30.0
+    assert payload["BG-mIoU"] is None
+    assert payload["class_iou_old"] == {"person": 50.0}
+    assert payload["class_iou_new"] == {"bicycle": 30.0}
+
+
+def test_run_detectron2_eval_ignores_non_finite_iou_values(monkeypatch, tmp_path: Path):
+    from covl_seg.engine import detectron2_runner as d2_runner
+
+    def _fake_run(cmd, cwd, check, env, **_kwargs):
+        output_dir = Path(cmd[cmd.index("OUTPUT_DIR") + 1])
+        inference_dir = output_dir / "inference"
+        inference_dir.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "sem_seg": {
+                "mIoU": 20.0,
+                "IoU-person": 50.0,
+                "IoU-bicycle": 30.0,
+                "IoU-car": float("nan"),
+            }
+        }
+        torch.save(payload, inference_dir / "sem_seg_evaluation.pth")
+
+        class _Completed:
+            stdout = ""
+            stderr = ""
+
+        return _Completed()
+
+    splits = tmp_path / "eval_with_non_finite" / "splits"
+    splits.mkdir(parents=True, exist_ok=True)
+    (splits / "seen_indexes.json").write_text("[0, 1]", encoding="utf-8")
+    (splits / "new_indexes.json").write_text("[1]", encoding="utf-8")
+    (splits / "unseen_indexes.json").write_text("[2]", encoding="utf-8")
+
+    monkeypatch.setattr(d2_runner, "detectron2_available", lambda: True)
+    monkeypatch.setattr(d2_runner.subprocess, "run", _fake_run)
+
+    payload = d2_runner.run_detectron2_eval(
+        config_path="covl_seg/configs/covl_seg_vitb_coco.yaml",
+        output_dir=tmp_path / "eval_with_non_finite",
+        resume_task=1,
+        checkpoint="/tmp/model_final.pth",
+        open_vocab=False,
+    )
+
+    assert payload["mIoU_old"] == 50.0
+    assert payload["mIoU_new"] == 30.0
+    assert payload["BG-mIoU"] is None
+    assert payload["class_iou_all"] == {"person": 50.0, "bicycle": 30.0}
 
 
 def test_run_detectron2_eval_can_disable_sliding_window(monkeypatch, tmp_path: Path):
@@ -564,9 +664,66 @@ def test_run_detectron2_train_retries_with_stability_overrides_on_nan(monkeypatc
     assert len(calls) == 2
     retry_cmd = calls[1]["cmd"]
     assert "SOLVER.AMP.ENABLED" in retry_cmd
-    assert retry_cmd[retry_cmd.index("SOLVER.AMP.ENABLED") + 1] == "False"
+    amp_indices = [i for i, token in enumerate(retry_cmd) if token == "SOLVER.AMP.ENABLED"]
+    assert retry_cmd[amp_indices[-1] + 1] == "False"
     assert "SOLVER.BASE_LR" in retry_cmd
-    assert retry_cmd[retry_cmd.index("SOLVER.BASE_LR") + 1] == "0.0001"
+    lr_indices = [i for i, token in enumerate(retry_cmd) if token == "SOLVER.BASE_LR"]
+    assert retry_cmd[lr_indices[-1] + 1] == "0.0001"
+
+
+def test_run_detectron2_train_retry_keeps_explicit_overrides_last(monkeypatch, tmp_path: Path):
+    import subprocess
+
+    from covl_seg.engine import detectron2_runner as d2_runner
+
+    calls = []
+
+    def _fake_run(cmd, cwd, check, env, **_kwargs):
+        calls.append({"cmd": cmd, "env": env})
+        if len(calls) == 1:
+            raise subprocess.CalledProcessError(
+                returncode=1,
+                cmd=cmd,
+                output="",
+                stderr="torch.cuda.OutOfMemoryError: CUDA out of memory",
+            )
+
+        class _Completed:
+            stdout = ""
+            stderr = ""
+
+        return _Completed()
+
+    monkeypatch.setattr(d2_runner, "detectron2_available", lambda: True)
+    monkeypatch.setattr(d2_runner.subprocess, "run", _fake_run)
+
+    out_dir = tmp_path / "exp"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / "metrics.json").write_text(
+        json.dumps({"iteration": 0, "total_loss": 1.0}) + "\n",
+        encoding="utf-8",
+    )
+
+    d2_runner.run_detectron2_train(
+        config_path="covl_seg/configs/covl_seg_vitb_ade15.yaml",
+        output_dir=out_dir,
+        seed=0,
+        resume_task=0,
+        max_tasks=1,
+        extra_overrides=[
+            "SOLVER.AMP.ENABLED",
+            "True",
+            "SOLVER.BASE_LR",
+            "0.123",
+        ],
+    )
+
+    assert len(calls) == 2
+    retry_cmd = calls[1]["cmd"]
+    amp_indices = [i for i, token in enumerate(retry_cmd) if token == "SOLVER.AMP.ENABLED"]
+    lr_indices = [i for i, token in enumerate(retry_cmd) if token == "SOLVER.BASE_LR"]
+    assert retry_cmd[amp_indices[-1] + 1] == "True"
+    assert retry_cmd[lr_indices[-1] + 1] == "0.123"
 
 
 def test_run_detectron2_train_uses_custom_project_root(monkeypatch, tmp_path: Path):
@@ -644,6 +801,160 @@ def test_run_detectron2_train_supports_segmentation_network_preset(monkeypatch, 
 
     assert len(calls) == 1
     assert any(token == str(project_root / "configs" / "swin_b_384.yaml") for token in calls[0])
+
+
+def test_run_detectron2_train_accepts_explicit_task_vocab_and_prior_weights(monkeypatch, tmp_path: Path):
+    from covl_seg.engine import detectron2_runner as d2_runner
+
+    calls = []
+
+    def _fake_run(cmd, cwd, check, env, **_kwargs):
+        calls.append(cmd)
+
+        class _Completed:
+            stdout = ""
+            stderr = ""
+
+        return _Completed()
+
+    monkeypatch.setattr(d2_runner, "detectron2_available", lambda: True)
+    monkeypatch.setattr(d2_runner.subprocess, "run", _fake_run)
+
+    out_dir = tmp_path / "exp"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / "metrics.json").write_text('{"iteration": 0, "total_loss": 0.9}\n', encoding="utf-8")
+
+    train_json = tmp_path / "train_class_names.json"
+    test_json = tmp_path / "test_class_names.json"
+    train_json.write_text('["person", "bicycle"]', encoding="utf-8")
+    test_json.write_text('["person", "bicycle", "car"]', encoding="utf-8")
+    prior_weights = tmp_path / "task_001_model_final.pth"
+    prior_weights.write_text("stub", encoding="utf-8")
+
+    d2_runner.run_detectron2_train(
+        config_path="covl_seg/configs/covl_seg_vitb_coco.yaml",
+        output_dir=out_dir,
+        seed=0,
+        resume_task=1,
+        max_tasks=1,
+        extra_overrides=[
+            "MODEL.SEM_SEG_HEAD.TRAIN_CLASS_JSON",
+            str(train_json),
+            "MODEL.SEM_SEG_HEAD.TEST_CLASS_JSON",
+            str(test_json),
+            "MODEL.WEIGHTS",
+            str(prior_weights),
+        ],
+    )
+
+    cmd = calls[0]
+    assert "MODEL.SEM_SEG_HEAD.TRAIN_CLASS_JSON" in cmd
+    assert cmd[cmd.index("MODEL.SEM_SEG_HEAD.TRAIN_CLASS_JSON") + 1] == str(train_json)
+    assert "MODEL.SEM_SEG_HEAD.TEST_CLASS_JSON" in cmd
+    assert cmd[cmd.index("MODEL.SEM_SEG_HEAD.TEST_CLASS_JSON") + 1] == str(test_json)
+    assert "MODEL.WEIGHTS" in cmd
+    assert cmd[cmd.index("MODEL.WEIGHTS") + 1] == str(prior_weights)
+
+
+def test_run_detectron2_train_requires_explicit_weights_when_resuming(monkeypatch, tmp_path: Path):
+    from covl_seg.engine import detectron2_runner as d2_runner
+
+    def _unexpected_run(*_args, **_kwargs):
+        raise AssertionError("training command should not run without explicit MODEL.WEIGHTS")
+
+    monkeypatch.setattr(d2_runner, "detectron2_available", lambda: True)
+    monkeypatch.setattr(d2_runner.subprocess, "run", _unexpected_run)
+
+    out_dir = tmp_path / "exp"
+
+    try:
+        d2_runner.run_detectron2_train(
+            config_path="covl_seg/configs/covl_seg_vitb_coco.yaml",
+            output_dir=out_dir,
+            seed=0,
+            resume_task=1,
+            max_tasks=1,
+            extra_overrides=[
+                "MODEL.SEM_SEG_HEAD.TRAIN_CLASS_JSON",
+                str(tmp_path / "train_class_names.json"),
+            ],
+        )
+    except RuntimeError as exc:
+        assert "MODEL.WEIGHTS" in str(exc)
+        assert "resume_task > 0" in str(exc)
+    else:
+        raise AssertionError("expected resume without explicit MODEL.WEIGHTS to fail")
+
+
+def test_run_detectron2_train_records_loaded_weight_path(monkeypatch, tmp_path: Path):
+    from covl_seg.engine import detectron2_runner as d2_runner
+
+    def _fake_run(cmd, cwd, check, env, **_kwargs):
+        class _Completed:
+            stdout = ""
+            stderr = ""
+
+        return _Completed()
+
+    monkeypatch.setattr(d2_runner, "detectron2_available", lambda: True)
+    monkeypatch.setattr(d2_runner.subprocess, "run", _fake_run)
+
+    out_dir = tmp_path / "exp"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / "metrics.json").write_text('{"iteration": 0, "total_loss": 1.0}\n', encoding="utf-8")
+    prior_weights = tmp_path / "prev_model.pth"
+    prior_weights.write_text("stub", encoding="utf-8")
+
+    d2_runner.run_detectron2_train(
+        config_path="covl_seg/configs/covl_seg_vitb_coco.yaml",
+        output_dir=out_dir,
+        seed=0,
+        resume_task=2,
+        max_tasks=1,
+        extra_overrides=["MODEL.WEIGHTS", str(prior_weights)],
+    )
+
+    payload = json.loads((out_dir / "checkpoint_task_003.json").read_text(encoding="utf-8"))
+    assert payload["loaded_weights"] == str(prior_weights)
+
+
+def test_run_detectron2_train_records_last_loaded_weight_path(monkeypatch, tmp_path: Path):
+    from covl_seg.engine import detectron2_runner as d2_runner
+
+    def _fake_run(cmd, cwd, check, env, **_kwargs):
+        class _Completed:
+            stdout = ""
+            stderr = ""
+
+        return _Completed()
+
+    monkeypatch.setattr(d2_runner, "detectron2_available", lambda: True)
+    monkeypatch.setattr(d2_runner.subprocess, "run", _fake_run)
+
+    out_dir = tmp_path / "exp"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / "metrics.json").write_text('{"iteration": 0, "total_loss": 1.0}\n', encoding="utf-8")
+    stale_weights = tmp_path / "stale_model.pth"
+    stale_weights.write_text("stale", encoding="utf-8")
+    final_weights = tmp_path / "final_model.pth"
+    final_weights.write_text("final", encoding="utf-8")
+
+    d2_runner.run_detectron2_train(
+        config_path="covl_seg/configs/covl_seg_vitb_coco.yaml",
+        output_dir=out_dir,
+        seed=0,
+        resume_task=2,
+        max_tasks=1,
+        extra_overrides=[
+            "MODEL.WEIGHTS",
+            str(stale_weights),
+            "MODEL.WEIGHTS",
+            str(final_weights),
+        ],
+    )
+
+    payload = json.loads((out_dir / "checkpoint_task_003.json").read_text(encoding="utf-8"))
+    assert payload["loaded_weights"] == str(final_weights)
 
 
 def test_default_project_root_is_internal_vendor(monkeypatch):

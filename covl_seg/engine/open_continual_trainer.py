@@ -21,8 +21,16 @@ from covl_seg.engine.balanced_controller import (
     BalancedControllerState,
     update_controller_state,
 )
-from covl_seg.engine.detectron2_runner import run_detectron2_eval, run_detectron2_train
+from covl_seg.engine.detectron2_runner import (
+    _d2_project_root,
+    _resolve_experiment_spec,
+    _resolve_class_names,
+    _select_base_eval_spec,
+    run_detectron2_eval,
+    run_detectron2_train,
+)
 from covl_seg.engine.hooks import append_metrics_jsonl
+from covl_seg.engine.mock_continual_runner import infer_num_classes_from_config as _infer_num_classes_from_config_mock
 from covl_seg.engine.phase_runner import (
     run_phase1_hciba,
     run_phase2_joint,
@@ -31,13 +39,13 @@ from covl_seg.engine.phase_runner import (
 )
 
 
-def _infer_num_classes_from_config(config_path: str) -> int:
-    text = Path(config_path).read_text(encoding="utf-8").lower()
-    if "ade20k_15" in text or "ade20k_100" in text:
-        return 150
-    if "coco" in text:
-        return 164
-    return 20
+def _infer_num_classes_from_config(config_path: str, *, strict: bool) -> int:
+    if strict:
+        return int(_resolve_experiment_spec(config_path)["num_classes"])
+    try:
+        return int(_resolve_experiment_spec(config_path)["num_classes"])
+    except ValueError:
+        return int(_infer_num_classes_from_config_mock(config_path))
 
 
 def _clip_overrides(mode: str) -> List[str]:
@@ -51,12 +59,64 @@ def _write_task_class_indexes(task_dir: Path, task: TaskDef) -> Dict[str, Path]:
     split_dir = task_dir / "splits"
     split_dir.mkdir(parents=True, exist_ok=True)
     train_indexes = split_dir / "seen_indexes.json"
+    old_indexes = split_dir / "old_indexes.json"
     new_indexes = split_dir / "new_indexes.json"
     test_indexes = split_dir / "unseen_indexes.json"
+    new_set = set(task.new_classes)
+    old_values = [idx for idx in task.seen_classes if idx not in new_set]
     train_indexes.write_text(json.dumps(task.seen_classes, indent=2), encoding="utf-8")
+    old_indexes.write_text(json.dumps(old_values, indent=2), encoding="utf-8")
     new_indexes.write_text(json.dumps(task.new_classes, indent=2), encoding="utf-8")
     test_indexes.write_text(json.dumps(task.background_classes, indent=2), encoding="utf-8")
-    return {"train": train_indexes, "new": new_indexes, "test": test_indexes}
+    return {"train": train_indexes, "old": old_indexes, "new": new_indexes, "test": test_indexes}
+
+
+def _write_task_class_artifacts(task_dir: Path, task: TaskDef, class_names: List[str]) -> Dict[str, Path]:
+    class_index_paths = _write_task_class_indexes(task_dir=task_dir, task=task)
+    split_dir = task_dir / "splits"
+    train_class_names = split_dir / "train_class_names.json"
+    test_class_names = split_dir / "test_class_names.json"
+    required_indexes = set(task.seen_classes + task.new_classes + task.background_classes)
+    max_index = max(required_indexes, default=-1)
+    if max_index >= len(class_names):
+        raise ValueError(
+            "Resolved class taxonomy is shorter than the task split indexes "
+            f"for task {task.task_id}: max_index={max_index}, taxonomy_size={len(class_names)}"
+        )
+    train_class_names.write_text(
+        json.dumps(class_names, indent=2),
+        encoding="utf-8",
+    )
+    test_class_names.write_text(
+        json.dumps(class_names, indent=2),
+        encoding="utf-8",
+    )
+    return {
+        "train_indexes": class_index_paths["train"],
+        "old_indexes": class_index_paths["old"],
+        "new_indexes": class_index_paths["new"],
+        "test_indexes": class_index_paths["test"],
+        "train_class_json": train_class_names,
+        "test_class_json": test_class_names,
+    }
+
+
+def _resolve_task_class_names(config_path: str) -> List[str]:
+    class_json = _select_base_eval_spec(config_path)["class_json"]
+    try:
+        project_root = _d2_project_root()
+    except RuntimeError:
+        project_root = Path(__file__).resolve().parents[2]
+    class_names = _resolve_class_names(
+        project_root=project_root,
+        class_json=class_json,
+    )
+    if class_names:
+        return class_names
+    raise ValueError(
+        "Unable to resolve class names for continual runtime artifacts from "
+        f"{class_json}. Add the dataset taxonomy JSON instead of using synthetic fallback names."
+    )
 
 
 def _build_phase_batch(task: TaskDef) -> Dict[str, object]:
@@ -107,6 +167,35 @@ def _build_phase_batch_from_d2_metrics(task_dir: Path, fallback_batch: Dict[str,
     }
 
 
+def _compute_task_coverage_metrics(task: TaskDef, eval_payload: Dict[str, object], task_main_iters: int) -> Dict[str, float]:
+    visible_count = len(task.seen_classes)
+    new_count = len(task.new_classes)
+    old_count = max(0, visible_count - new_count)
+
+    old_map = eval_payload.get("class_iou_old")
+    new_map = eval_payload.get("class_iou_new")
+    old_eval_count = len(old_map) if isinstance(old_map, dict) else 0
+    new_eval_count = len(new_map) if isinstance(new_map, dict) else 0
+    visible_eval_count = old_eval_count + new_eval_count
+
+    coverage_visible_ratio = float(visible_eval_count / visible_count) if visible_count > 0 else 0.0
+    coverage_old_ratio = float(old_eval_count / old_count) if old_count > 0 else 0.0
+    coverage_new_ratio = float(new_eval_count / new_count) if new_count > 0 else 0.0
+    steps_per_visible = float(task_main_iters / visible_count) if visible_count > 0 else 0.0
+
+    return {
+        "visible_class_count": float(visible_count),
+        "new_class_count": float(new_count),
+        "old_class_count": float(old_count),
+        "evaluated_visible_class_count": float(visible_eval_count),
+        "coverage_visible_ratio": coverage_visible_ratio,
+        "coverage_old_ratio": coverage_old_ratio,
+        "coverage_new_ratio": coverage_new_ratio,
+        "task_main_iters": float(task_main_iters),
+        "steps_per_visible_class": steps_per_visible,
+    }
+
+
 def _compute_omega_tau_t(current_basis: List[float], basis_history: List[List[float]]) -> float:
     if not basis_history or not current_basis:
         return 0.0
@@ -132,6 +221,110 @@ def _safe_float(value: object) -> Optional[float]:
 def _safe_float_or(value: object, default: float) -> float:
     parsed = _safe_float(value)
     return default if parsed is None else parsed
+
+
+def _format_metric(value: object, precision: int = 3) -> str:
+    parsed = _safe_float(value)
+    if parsed is None:
+        return "N/A"
+    return f"{parsed:.{precision}f}"
+
+
+def _mean_metric_map(values: object) -> Optional[float]:
+    if not isinstance(values, dict):
+        return None
+    finite: List[float] = []
+    for value in values.values():
+        parsed = _safe_float(value)
+        if parsed is not None:
+            finite.append(parsed)
+    if not finite:
+        return None
+    return float(sum(finite) / len(finite))
+
+
+def _read_d2_metrics(task_dir: Path) -> List[Dict[str, float]]:
+    metrics_path = task_dir / "metrics.json"
+    if not metrics_path.exists():
+        return []
+    rows: List[Dict[str, float]] = []
+    for line in metrics_path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(payload, dict):
+            rows.append(payload)
+    return rows
+
+
+def _resolve_prior_task_weight_path(output_dir: Path, state: dict, task_id: int) -> Optional[Path]:
+    if task_id <= 1:
+        return None
+    expected = output_dir / f"task_{task_id - 1:03d}" / "model_final.pth"
+    if expected.exists() and expected.is_file():
+        return expected
+    persisted = state.get("latest_model_path")
+    if persisted:
+        persisted_path = Path(str(persisted))
+        if persisted_path.exists() and persisted_path.is_file():
+            return persisted_path
+    return expected
+
+
+def _mean_from_keys(rows: List[Dict[str, float]], keys: List[str]) -> Optional[float]:
+    values: List[float] = []
+    for row in rows:
+        for key in keys:
+            parsed = _safe_float(row.get(key))
+            if parsed is not None:
+                values.append(parsed)
+                break
+    if not values:
+        return None
+    return float(sum(values) / len(values))
+
+
+def _estimate_beta_star_from_train(rows: List[Dict[str, float]]) -> Optional[float]:
+    losses: List[float] = []
+    for row in rows:
+        parsed = _safe_float(row.get("total_loss"))
+        if parsed is not None:
+            losses.append(parsed)
+    if len(losses) < 2:
+        return None
+    mean_loss = sum(losses) / len(losses)
+    if mean_loss <= 0.0:
+        return 0.0
+    variance = sum((x - mean_loss) ** 2 for x in losses) / len(losses)
+    std = math.sqrt(max(variance, 0.0))
+    return float(max(0.0, std / (mean_loss + 1e-8)))
+
+
+def _compute_class_iou_overlap(
+    current: Optional[Dict[str, float]],
+    history: List[Dict[str, float]],
+) -> float:
+    if not isinstance(current, dict) or not current or not history:
+        return 0.0
+    best = 0.0
+    for previous in history:
+        if not previous:
+            continue
+        common = sorted(set(current.keys()).intersection(previous.keys()))
+        if not common:
+            continue
+        curr_vec = torch.tensor([float(current[name]) for name in common], dtype=torch.float32)
+        prev_vec = torch.tensor([float(previous[name]) for name in common], dtype=torch.float32)
+        denom = (torch.norm(curr_vec) * torch.norm(prev_vec)).item()
+        if denom <= 0.0:
+            continue
+        cosine = float(torch.dot(curr_vec, prev_vec).item() / denom)
+        best = max(best, max(0.0, min(1.0, cosine)))
+    return best
 
 
 def _build_d2_progress_callback(task_id: int, total_tasks: int, task_total_iters: int):
@@ -251,6 +444,12 @@ class OpenContinualTrainer:
     skip_per_task_eval: bool = False
     eval_sliding_window: bool = True
     eval_max_samples_per_task: Optional[int] = None
+    train_iters_mode: str = "auto"
+    min_iters_per_visible_class: int = 350
+    max_iters_multiplier: float = 2.0
+    lambda_old_kd: float = 1.0
+    lambda_old_clip: float = 0.1
+    lambda_unseen_clip: float = 0.2
     resume_task: int = 0
 
     @classmethod
@@ -290,11 +489,37 @@ class OpenContinualTrainer:
             skip_per_task_eval=args.skip_per_task_eval,
             eval_sliding_window=args.eval_sliding_window,
             eval_max_samples_per_task=args.eval_max_samples_per_task,
+            train_iters_mode=args.train_iters_mode,
+            min_iters_per_visible_class=args.min_iters_per_visible_class,
+            max_iters_multiplier=args.max_iters_multiplier,
+            lambda_old_kd=getattr(args, "lambda_old_kd", 1.0),
+            lambda_old_clip=getattr(args, "lambda_old_clip", 0.1),
+            lambda_unseen_clip=getattr(args, "lambda_unseen_clip", 0.2),
             resume_task=args.resume_task,
         )
 
+    def _resolve_task_main_iters(self, task: TaskDef) -> int:
+        base_iters = int(max(1, self.n_main))
+        mode = str(self.train_iters_mode).strip().lower()
+        if mode not in {"off", "on", "auto"}:
+            raise ValueError(f"Unsupported train_iters_mode: {self.train_iters_mode}")
+        if mode == "off" or base_iters < 50:
+            return base_iters
+
+        should_scale = mode == "on" or (mode == "auto" and len(task.seen_classes) > len(task.new_classes))
+        if not should_scale:
+            return base_iters
+
+        visible_count = max(1, len(task.seen_classes))
+        target_iters = max(base_iters, int(self.min_iters_per_visible_class) * visible_count)
+        cap_iters = max(base_iters, int(round(base_iters * float(self.max_iters_multiplier))))
+        return int(max(base_iters, min(target_iters, cap_iters)))
+
     def _build_task_plan(self) -> TaskPlan:
-        total_classes = _infer_num_classes_from_config(self.config_path)
+        total_classes = _infer_num_classes_from_config(
+            self.config_path,
+            strict=self.engine == "d2",
+        )
         resolved_num_tasks = self.num_tasks
         resolved_classes_per_task = self.classes_per_task
 
@@ -333,11 +558,27 @@ class OpenContinualTrainer:
 
     def _validate_resume(self, state: dict) -> None:
         if not state:
+            if self.engine == "d2" and self.resume_task > 0:
+                raise ValueError(
+                    "D2 resume requires a prior model artifact, but no continual state was found."
+                )
             return
         prior_method = state.get("method")
         if prior_method is not None and prior_method != self.method_name:
             raise ValueError(
                 f"Resume method mismatch: existing={prior_method}, requested={self.method_name}"
+            )
+        if self.engine != "d2" or self.resume_task <= 0:
+            return
+        prior_weight_path = _resolve_prior_task_weight_path(
+            output_dir=self.output_dir,
+            state=state,
+            task_id=self.resume_task + 1,
+        )
+        if prior_weight_path is None or not prior_weight_path.exists() or not prior_weight_path.is_file():
+            raise ValueError(
+                "D2 resume requires a valid prior model artifact at "
+                f"{prior_weight_path} for resume_task={self.resume_task}."
             )
 
     def run(self, max_tasks: Optional[int] = None) -> Dict[str, float]:
@@ -363,6 +604,7 @@ class OpenContinualTrainer:
         alpha_star_history = list(state.get("alpha_star_history", []))
         tau_pred_history = list(state.get("tau_pred_history", []))
         basis_history = list(state.get("basis_history", []))
+        class_iou_history = list(state.get("class_iou_history", []))
         balanced_prev_eval = dict(state.get("balanced_prev_eval", {}))
 
         balanced_enabled = self.balanced_profile == "balanced"
@@ -397,6 +639,7 @@ class OpenContinualTrainer:
             "enable_sacr": self.enable_sacr,
         }
         clip_overrides = _clip_overrides(self.clip_finetune)
+        class_names = _resolve_task_class_names(self.config_path) if self.engine == "d2" else None
 
         completed = 0
         for task in plan.tasks:
@@ -408,10 +651,11 @@ class OpenContinualTrainer:
             task_dir = self.output_dir / f"task_{task.task_id:03d}"
             total_tasks = len(plan.tasks)
             remaining_tasks = max(0, total_tasks - task.task_id)
+            task_main_iters = self._resolve_task_main_iters(task)
             progress = _D2TaskProgress(
                 task_id=task.task_id,
                 total_tasks=total_tasks,
-                task_total_iters=self.n_main,
+                task_total_iters=task_main_iters,
             ) if self.engine == "d2" else None
             method.before_task(task_state={"task_id": task.task_id})
             method_phase_cfg = method.phase_overrides()
@@ -432,7 +676,7 @@ class OpenContinualTrainer:
                     "balanced_rho_new": float(balanced_state.rho_new),
                     "balanced_rho_old": float(balanced_state.rho_old),
                 }
-            phase_cfg = {**task_cfg, **method_phase_cfg, **balanced_knobs}
+            phase_cfg = {**task_cfg, **method_phase_cfg, **balanced_knobs, "n_main": task_main_iters}
             batch = _build_phase_batch(task)
 
             p1 = run_phase1_hciba(task.task_id, phase_cfg, batch=batch)
@@ -442,21 +686,58 @@ class OpenContinualTrainer:
 
             current_basis = p3.get("subspace_basis", [])
             p3["omega_tau_t"] = float(_compute_omega_tau_t(current_basis, basis_history))
-
-            class_index_paths = _write_task_class_indexes(task_dir=task_dir, task=task)
-            task_overrides = clip_overrides + [
-                "MODEL.SEM_SEG_HEAD.TRAIN_CLASS_INDEXES",
-                str(class_index_paths["train"]),
-                "MODEL.SEM_SEG_HEAD.TEST_CLASS_INDEXES",
-                str(class_index_paths["test"]),
-                "SOLVER.MAX_ITER",
-                str(self.n_main),
-                "TEST.EVAL_PERIOD",
-                "0",
-            ]
+            real_continual = {
+                "beta_1_star": _safe_float(p1.get("beta_1_star")),
+                "ctr_loss": _safe_float(p2.get("ctr_loss")),
+                "alpha_star": _safe_float(p3.get("alpha_star")),
+                "tau_pred": _safe_float(p3.get("tau_pred")),
+                "omega_tau_t": _safe_float(p3.get("omega_tau_t")),
+            }
 
             eval_payload = None
             if self.engine == "d2":
+                assert class_names is not None
+                class_artifacts = _write_task_class_artifacts(
+                    task_dir=task_dir,
+                    task=task,
+                    class_names=class_names,
+                )
+                task_overrides = clip_overrides + [
+                    "MODEL.SEM_SEG_HEAD.TRAIN_CLASS_JSON",
+                    str(class_artifacts["train_class_json"].resolve()),
+                    "MODEL.SEM_SEG_HEAD.TEST_CLASS_JSON",
+                    str(class_artifacts["test_class_json"].resolve()),
+                    "MODEL.SEM_SEG_HEAD.TRAIN_CLASS_INDEXES",
+                    str(class_artifacts["train_indexes"].resolve()),
+                    "MODEL.SEM_SEG_HEAD.TRAIN_OLD_CLASS_INDEXES",
+                    str(class_artifacts["old_indexes"].resolve()),
+                    "MODEL.SEM_SEG_HEAD.TRAIN_UNSEEN_CLASS_INDEXES",
+                    str(class_artifacts["test_indexes"].resolve()),
+                    "MODEL.SEM_SEG_HEAD.TEST_CLASS_INDEXES",
+                    str(class_artifacts["test_indexes"].resolve()),
+                    "MODEL.SEM_SEG_HEAD.OLD_TEACHER_WEIGHTS",
+                    "",
+                    "MODEL.SEM_SEG_HEAD.LAMBDA_OLD_KD",
+                    str(float(self.lambda_old_kd)),
+                    "MODEL.SEM_SEG_HEAD.LAMBDA_OLD_CLIP",
+                    str(float(self.lambda_old_clip)),
+                    "MODEL.SEM_SEG_HEAD.LAMBDA_UNSEEN_CLIP",
+                    str(float(self.lambda_unseen_clip)),
+                    "SOLVER.MAX_ITER",
+                    str(task_main_iters),
+                    "TEST.EVAL_PERIOD",
+                    "0",
+                ]
+                prior_weight_path = _resolve_prior_task_weight_path(
+                    output_dir=self.output_dir,
+                    state=state,
+                    task_id=task.task_id,
+                )
+                if prior_weight_path is not None:
+                    task_overrides[task_overrides.index("MODEL.SEM_SEG_HEAD.OLD_TEACHER_WEIGHTS") + 1] = str(
+                        prior_weight_path.resolve()
+                    )
+                    task_overrides.extend(["MODEL.WEIGHTS", str(prior_weight_path.resolve())])
                 try:
                     run_detectron2_train(
                         config_path=self.config_path,
@@ -484,20 +765,11 @@ class OpenContinualTrainer:
                 p4 = run_phase4_replay_update(task.task_id, phase_cfg, batch=d2_batch)
                 current_basis = p3.get("subspace_basis", [])
                 p3["omega_tau_t"] = float(_compute_omega_tau_t(current_basis, basis_history))
-
                 for record in (p1, p2, p3, p4):
-                    record["proxy_source"] = "d2_metrics"
-                    append_metrics_jsonl(self._metrics_path(), record)
-
-                print(
-                    "[open-continual] "
-                    f"task {task.task_id}/{total_tasks} continual | "
-                    f"beta_1_star={float(p1.get('beta_1_star', float('nan'))):.4f} | "
-                    f"ctr_loss={float(p2.get('ctr_loss', float('nan'))):.4f} | "
-                    f"alpha_star={float(p3.get('alpha_star', float('nan'))):.4f} | "
-                    f"tau_pred={float(p3.get('tau_pred', float('nan'))):.4f} | "
-                    f"omega_tau_t={float(p3.get('omega_tau_t', float('nan'))):.4f}"
-                )
+                    d2_record = dict(record)
+                    d2_record["proxy_source"] = "derived_from_d2_train_metrics"
+                    d2_record["engine"] = "d2"
+                    append_metrics_jsonl(self._metrics_path(), d2_record)
 
                 if not self.skip_per_task_eval:
                     print(
@@ -526,6 +798,11 @@ class OpenContinualTrainer:
                         )
                     finally:
                         eval_progress.close()
+                    coverage_metrics = _compute_task_coverage_metrics(
+                        task=task,
+                        eval_payload=eval_payload,
+                        task_main_iters=task_main_iters,
+                    )
                     append_metrics_jsonl(
                         self._metrics_path(),
                         {
@@ -535,23 +812,100 @@ class OpenContinualTrainer:
                             "mIoU_old": _safe_float(eval_payload.get("mIoU_old")),
                             "mIoU_new": _safe_float(eval_payload.get("mIoU_new")),
                             "BG-mIoU": _safe_float(eval_payload.get("BG-mIoU")),
+                            "class_iou_all": eval_payload.get("class_iou_all") if isinstance(eval_payload.get("class_iou_all"), dict) else {},
+                            "class_iou_old": eval_payload.get("class_iou_old") if isinstance(eval_payload.get("class_iou_old"), dict) else {},
+                            "class_iou_new": eval_payload.get("class_iou_new") if isinstance(eval_payload.get("class_iou_new"), dict) else {},
+                            "class_iou_bg": eval_payload.get("class_iou_bg") if isinstance(eval_payload.get("class_iou_bg"), dict) else {},
                             "engine": "d2",
+                            **coverage_metrics,
                         },
                     )
                     print(
                         "[open-continual] "
                         f"task {task.task_id}/{total_tasks} eval result | "
-                        f"mIoU_all={float(eval_payload.get('mIoU_all', float('nan'))):.3f} | "
-                        f"mIoU_old={float(eval_payload.get('mIoU_old', float('nan'))):.3f} | "
-                        f"mIoU_new={float(eval_payload.get('mIoU_new', float('nan'))):.3f} | "
-                        f"BG-mIoU={float(eval_payload.get('BG-mIoU', float('nan'))):.3f}"
+                        f"mIoU_all={_format_metric(eval_payload.get('mIoU_all'))} | "
+                        f"mIoU_old={_format_metric(eval_payload.get('mIoU_old'))} | "
+                        f"mIoU_new={_format_metric(eval_payload.get('mIoU_new'))} | "
+                        f"BG-mIoU={_format_metric(eval_payload.get('BG-mIoU'))}"
                     )
 
+                    ov_pairs = []
+                    for key in sorted(eval_payload.keys()):
+                        if key.startswith("ov_mIoU_"):
+                            ov_pairs.append(f"{key}={_format_metric(eval_payload.get(key))}")
+                    if ov_pairs:
+                        print(
+                            "[open-continual] "
+                            f"task {task.task_id}/{total_tasks} open-vocab result | "
+                            + " | ".join(ov_pairs)
+                        )
+
+                    old_map = eval_payload.get("class_iou_old")
+                    new_map = eval_payload.get("class_iou_new")
+                    bg_map = eval_payload.get("class_iou_bg")
                     class_iou_all = eval_payload.get("class_iou_all")
+                    old_count = len(old_map) if isinstance(old_map, dict) else 0
+                    new_count = len(new_map) if isinstance(new_map, dict) else 0
+                    bg_count = len(bg_map) if isinstance(bg_map, dict) else 0
+                    old_avg = _mean_metric_map(old_map)
+                    new_avg = _mean_metric_map(new_map)
+                    bg_avg = _mean_metric_map(bg_map)
+
+                    train_rows = _read_d2_metrics(task_dir)
+                    real_beta = _estimate_beta_star_from_train(train_rows)
+                    real_ctr = _mean_from_keys(train_rows, ["loss_ctr", "ctr_loss", "loss_contrastive"])
+                    real_alpha = None
+                    if old_avg is not None and new_avg is not None and (old_avg + new_avg) > 0.0:
+                        real_alpha = float(old_avg / (old_avg + new_avg))
+                    elif new_avg is not None:
+                        real_alpha = 0.0
+                    real_tau = _mean_from_keys(train_rows, ["loss_sem_seg", "total_loss"])
+                    real_overlap = _compute_class_iou_overlap(
+                        class_iou_all if isinstance(class_iou_all, dict) else None,
+                        [x for x in class_iou_history if isinstance(x, dict)],
+                    )
+                    real_continual = {
+                        "beta_1_star": real_beta,
+                        "ctr_loss": real_ctr,
+                        "alpha_star": real_alpha,
+                        "tau_pred": real_tau,
+                        "omega_tau_t": real_overlap,
+                    }
+                    append_metrics_jsonl(
+                        self._metrics_path(),
+                        {
+                            "task": float(task.task_id),
+                            "phase": "continual_real",
+                            "metric_source": "derived_from_real_artifacts",
+                            "beta_1_star": _safe_float(real_continual.get("beta_1_star")),
+                            "ctr_loss": _safe_float(real_continual.get("ctr_loss")),
+                            "alpha_star": _safe_float(real_continual.get("alpha_star")),
+                            "tau_pred": _safe_float(real_continual.get("tau_pred")),
+                            "omega_tau_t": _safe_float(real_continual.get("omega_tau_t")),
+                            "engine": "d2",
+                        },
+                    )
                     if isinstance(class_iou_all, dict) and class_iou_all:
-                        old_map = eval_payload.get("class_iou_old")
-                        new_map = eval_payload.get("class_iou_new")
-                        bg_map = eval_payload.get("class_iou_bg")
+                        class_iou_history.append(class_iou_all)
+
+                    print(
+                        "[open-continual] "
+                        f"task {task.task_id}/{total_tasks} continual-real | "
+                        f"beta_1_star={_format_metric(real_continual.get('beta_1_star'), precision=4)} | "
+                        f"ctr_loss={_format_metric(real_continual.get('ctr_loss'), precision=4)} | "
+                        f"alpha_star={_format_metric(real_continual.get('alpha_star'), precision=4)} | "
+                        f"tau_pred={_format_metric(real_continual.get('tau_pred'), precision=4)} | "
+                        f"omega_tau_t={_format_metric(real_continual.get('omega_tau_t'), precision=4)}"
+                    )
+                    print(
+                        "[open-continual] "
+                        f"task {task.task_id}/{total_tasks} continual-real summary | "
+                        f"old_count={old_count} old_mIoU={_format_metric(old_avg)} | "
+                        f"new_count={new_count} new_mIoU={_format_metric(new_avg)} | "
+                        f"bg_count={bg_count} bg_mIoU={_format_metric(bg_avg)}"
+                    )
+
+                    if isinstance(class_iou_all, dict) and class_iou_all:
                         old_names = set(old_map.keys()) if isinstance(old_map, dict) else set()
                         new_names = set(new_map.keys()) if isinstance(new_map, dict) else set()
                         bg_names = set(bg_map.keys()) if isinstance(bg_map, dict) else set()
@@ -644,21 +998,26 @@ class OpenContinualTrainer:
                     balanced_prev_eval = current_eval
 
             method_state = method.after_task(task_state={"task_id": task.task_id})
-            alpha_star_history.append(float(p3["alpha_star"]))
-            tau_pred_history.append(float(p3["tau_pred"]))
+            alpha_star_history.append(_safe_float_or(real_continual.get("alpha_star"), float(p3["alpha_star"])))
+            tau_pred_history.append(_safe_float_or(real_continual.get("tau_pred"), float(p3["tau_pred"])))
             if current_basis:
                 basis_history.append(current_basis)
+            latest_model_path = state.get("latest_model_path")
+            if self.engine == "d2":
+                latest_model_path = str(task_dir / "model_final.pth")
             state = {
                 "current_task": task.task_id,
                 "method": method.name,
                 "clip_finetune": self.clip_finetune,
-                "alpha_star": p3["alpha_star"],
-                "tau_pred": p3["tau_pred"],
+                "alpha_star": _safe_float_or(real_continual.get("alpha_star"), float(p3["alpha_star"])),
+                "tau_pred": _safe_float_or(real_continual.get("tau_pred"), float(p3["tau_pred"])),
                 "alpha_star_history": alpha_star_history,
                 "tau_pred_history": tau_pred_history,
                 "basis_history": basis_history,
+                "class_iou_history": class_iou_history,
                 "method_state": method_state.values,
                 "last_task_dir": str(task_dir),
+                "latest_model_path": latest_model_path,
             }
             if balanced_enabled:
                 state["balanced_controller"] = {

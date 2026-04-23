@@ -3,11 +3,8 @@ import json
 from pathlib import Path
 from typing import Dict, Optional
 
-import torch
-
-from covl_seg.engine.evaluator import compute_basic_miou, summarize_metrics
 from covl_seg.engine.detectron2_runner import detectron2_available, run_detectron2_eval
-from covl_seg.engine.open_vocab_eval import OpenVocabEvaluator
+from covl_seg.engine.mock_continual_runner import eval_mock_continual
 
 
 def _parse_bool_flag(value: str) -> bool:
@@ -65,13 +62,6 @@ def resolve_engine(requested: str, detectron2_ready: bool) -> str:
     raise ValueError(f"Unsupported engine: {requested}")
 
 
-def _read_metrics_jsonl(file_path: Path) -> int:
-    if not file_path.exists():
-        return 0
-    lines = [line for line in file_path.read_text(encoding="utf-8").splitlines() if line.strip()]
-    return len(lines)
-
-
 def run_eval_once(
     config_path: str,
     output_dir: Path,
@@ -97,36 +87,13 @@ def run_eval_once(
         )
 
     output_dir.mkdir(parents=True, exist_ok=True)
-    metrics_records = _read_metrics_jsonl(output_dir / "metrics.jsonl")
-
-    torch.manual_seed(100 + resume_task)
-    logits = torch.randn(1, 4, 16, 16)
-    targets = torch.randint(0, 4, (1, 16, 16))
-    pred = logits.argmax(dim=1)
-
-    miou_all = compute_basic_miou(pred=pred, target=targets, num_classes=4)
-    base = summarize_metrics(
-        miou_all=miou_all,
-        miou_old=max(miou_all - 1.0, 0.0),
-        miou_new=min(miou_all + 1.0, 100.0),
-        bg_miou=max(miou_all - 2.0, 0.0),
+    return eval_mock_continual(
+        config_path=config_path,
+        output_dir=output_dir,
+        resume_task=resume_task,
+        checkpoint=checkpoint,
+        open_vocab=open_vocab,
     )
-    base["resume_task"] = float(resume_task)
-    base["train_metric_records"] = float(metrics_records)
-    if checkpoint is not None:
-        base["checkpoint"] = checkpoint
-    else:
-        base["checkpoint"] = f"checkpoint_task_{resume_task:03d}.json"
-    base["config"] = config_path
-    base["engine"] = "mock"
-
-    if open_vocab:
-        ov = OpenVocabEvaluator(dataset_aliases={"pc59": "pascal_context_59"})
-        ov_metrics = ov.evaluate_dataset(dataset_key="pc59", logits=logits[:, :3], targets=targets.clamp_max(2))
-        base.update(ov_metrics)
-
-    (output_dir / "eval_summary.json").write_text(json.dumps(base, indent=2), encoding="utf-8")
-    return base
 
 
 def main() -> None:

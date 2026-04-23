@@ -5,9 +5,8 @@ from typing import Dict, Optional
 
 import torch
 
-from covl_seg.engine.hooks import append_metrics_jsonl
 from covl_seg.engine.detectron2_runner import detectron2_available, run_detectron2_train
-from covl_seg.engine.trainer import FourPhaseTrainer, PhaseController
+from covl_seg.engine.mock_continual_runner import train_mock_continual
 from covl_seg.scripts.bootstrap_coco_train import (
     _resolve_d2_runtime_root,
     ensure_coco_stuff_ready_for_training,
@@ -84,16 +83,6 @@ def run_smoke_once(output_dir: Path, seed: int = 0) -> dict:
     return payload
 
 
-def _build_minimal_trainer(seed: int) -> FourPhaseTrainer:
-    torch.manual_seed(seed)
-    f_s = torch.nn.Linear(8, 8)
-    phi = torch.nn.Linear(8, 8)
-    mine = torch.nn.Linear(8, 1)
-    model = torch.nn.Sequential(f_s, torch.nn.ReLU(), phi)
-    controller = PhaseController(f_s=f_s, phi=phi, mine=mine)
-    return FourPhaseTrainer(model=model, controller=controller, seed=seed)
-
-
 def run_train_once(
     config_path: str,
     output_dir: Path,
@@ -124,31 +113,13 @@ def run_train_once(
             seg_network=seg_net,
         )
 
-    trainer = _build_minimal_trainer(seed=seed)
-    num_tasks = max_tasks if max_tasks is not None else 1
-    metrics_path = output_dir / "metrics.jsonl"
-
-    phase_records = trainer.run_tasks(num_tasks=num_tasks, start_task=resume_task)
-    for record in phase_records:
-        append_metrics_jsonl(metrics_path, record)
-
-    last_task = resume_task + num_tasks
-    checkpoint_payload = {
-        "config": config_path,
-        "seed": seed,
-        "resume_task": resume_task,
-        "last_task": last_task,
-        "num_phase_records": len(phase_records),
-        "engine": "mock",
-    }
-    checkpoint_name = f"checkpoint_task_{last_task:03d}.json"
-    (output_dir / checkpoint_name).write_text(json.dumps(checkpoint_payload, indent=2), encoding="utf-8")
-
-    return {
-        "num_tasks": num_tasks,
-        "num_phase_records": len(phase_records),
-        "last_task": last_task,
-    }
+    return train_mock_continual(
+        config_path=config_path,
+        output_dir=output_dir,
+        seed=seed,
+        resume_task=resume_task,
+        max_tasks=max_tasks,
+    )
 
 
 def main() -> None:

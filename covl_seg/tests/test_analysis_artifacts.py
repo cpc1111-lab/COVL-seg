@@ -87,3 +87,39 @@ def test_generate_analysis_artifacts_writes_proxy_curves(tmp_path):
     assert task_summary["2"]["ov_min_delta"] == 0.09
     assert task_summary["1"]["ov_guard_triggered"] is True
     assert task_summary["2"]["ov_guard_state"] == "inactive"
+
+
+def test_generate_analysis_artifacts_falls_back_to_eval_metrics_when_eval_summary_missing(tmp_path):
+    metrics = tmp_path / "metrics.jsonl"
+    metrics.write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "task": 1,
+                        "phase": "eval",
+                        "mIoU_all": 55.0,
+                        "class_iou_all": {"cls_a": 40.0, "cls_b": 50.0},
+                        "class_iou_old": {"cls_a": 40.0},
+                        "class_iou_new": {"cls_b": 50.0},
+                        "class_iou_bg": {},
+                    }
+                )
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    out = tmp_path / "analysis"
+    payload = generate_analysis_artifacts(metrics_jsonl=metrics, output_dir=out, run_dir=tmp_path)
+    assert payload["num_records"] == 1
+
+    group_rows = json.loads((out / "analysis_group_trends.json").read_text(encoding="utf-8"))
+    assert len(group_rows) == 1
+    assert group_rows[0]["count_old"] == 1
+    assert group_rows[0]["count_new"] == 1
+
+    class_trends = json.loads((out / "analysis_class_iou_trends.json").read_text(encoding="utf-8"))
+    assert "cls_a" in class_trends
+    assert "cls_b" in class_trends

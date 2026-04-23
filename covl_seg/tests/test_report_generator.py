@@ -136,6 +136,30 @@ def test_missing_fields_only_matching_figures(tmp_path):
     assert "fig_sacr_replay" not in result
 
 
+def test_generate_report_handles_single_axis_theory_series(tmp_path):
+    from covl_seg.engine.report_generator import generate_report
+
+    metrics = tmp_path / "metrics.jsonl"
+    metrics.write_text(
+        "\n".join(
+            [
+                json.dumps({"task": 1, "phase": "phase1", "I_exc_C": 0.5, "I_exc_S": 0.6}),
+                json.dumps({"task": 1, "phase": "phase2", "ctr_loss": -0.03}),
+                json.dumps({"task": 1, "phase": "phase3", "alpha_star": 0.45, "fisher_energy": 0.8}),
+                json.dumps({"task": 1, "phase": "phase4", "replay_priority_total": 5.0}),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    result = generate_report(run_dir=tmp_path)
+    assert "fig_theory_alpha_tau" in result
+    assert "fig_theory_spectral" in result
+    assert "fig_bg_ctr" in result
+    assert "fig_sacr_replay" in result
+
+
 def test_missing_metrics_jsonl_returns_empty(tmp_path):
     from covl_seg.engine.report_generator import generate_report
 

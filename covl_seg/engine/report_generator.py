@@ -263,6 +263,7 @@ def _fig_theory_alpha_tau_run(records: List[Dict[str, float]], output_dir: Path)
         return None
 
     fig, ax1 = plt.subplots(figsize=(10, 5))
+    ax2 = None
     if xs_alpha and ys_alpha:
         ax1.plot(xs_alpha, ys_alpha, marker="o", color="tab:blue", label="alpha*(t)")
     ax1.set_xlabel("Task")
@@ -348,6 +349,7 @@ def _fig_theory_spectral_run(records: List[Dict[str, float]], output_dir: Path) 
         return None
 
     fig, ax1 = plt.subplots(figsize=(10, 5))
+    ax2 = None
     ax1.bar(xs_fisher, ys_fisher, color="tab:blue", alpha=0.7, label="Fisher Energy")
     ax1.set_xlabel("Task")
     ax1.set_ylabel("Fisher Energy", color="tab:blue")
@@ -392,6 +394,7 @@ def _fig_bg_ctr_run(records: List[Dict[str, float]], output_dir: Path) -> Option
         return None
 
     fig, ax1 = plt.subplots(figsize=(10, 5))
+    ax2 = None
     if xs_loss and ys_loss:
         ys_loss_abs = [abs(y) for y in ys_loss]
         ax1.plot(xs_loss, ys_loss_abs, marker="o", label="|CTR loss|", color="tab:blue")
@@ -438,6 +441,7 @@ def _fig_sacr_replay_run(records: List[Dict[str, float]], output_dir: Path) -> O
         return None
 
     fig, ax1 = plt.subplots(figsize=(10, 5))
+    ax2 = None
     ax1.bar(xs_total, ys_total, color="tab:blue", alpha=0.7, label="replay_priority_total")
     ax1.set_xlabel("Task")
     ax1.set_ylabel("replay_priority_total", color="tab:blue")

@@ -68,6 +68,27 @@ def build_parser() -> argparse.ArgumentParser:
 
     parser.add_argument("--n-pre", type=int, default=200)
     parser.add_argument("--n-main", type=int, default=4000)
+    parser.add_argument(
+        "--train-iters-mode",
+        choices=["off", "on", "auto"],
+        default="auto",
+        help="How to scale per-task train iterations from visible class count",
+    )
+    parser.add_argument(
+        "--min-iters-per-visible-class",
+        type=int,
+        default=350,
+        help="Minimum per-class training budget when train-iters-mode is on/auto",
+    )
+    parser.add_argument(
+        "--max-iters-multiplier",
+        type=float,
+        default=2.0,
+        help="Upper bound multiplier for per-task train iterations",
+    )
+    parser.add_argument("--lambda-old-kd", type=float, default=1.0)
+    parser.add_argument("--lambda-old-clip", type=float, default=0.1)
+    parser.add_argument("--lambda-unseen-clip", type=float, default=0.2)
     parser.add_argument("--eps-f", type=float, default=0.05)
     parser.add_argument("--t-mem", default="all")
     parser.add_argument("--mix-ratio", nargs=2, type=int, default=[3, 1])

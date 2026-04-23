@@ -41,6 +41,29 @@ def _read_task_eval_summaries(run_dir: Path) -> Dict[int, Dict[str, object]]:
     return summaries
 
 
+def _read_task_eval_summaries_from_metrics(records: List[Dict[str, object]]) -> Dict[int, Dict[str, object]]:
+    summaries: Dict[int, Dict[str, object]] = {}
+    for rec in records:
+        if rec.get("phase") != "eval":
+            continue
+        task_val = rec.get("task")
+        try:
+            task_id = int(float(task_val))
+        except (TypeError, ValueError):
+            continue
+        class_iou_all = rec.get("class_iou_all")
+        if not isinstance(class_iou_all, dict):
+            continue
+        payload: Dict[str, object] = {
+            "class_iou_all": class_iou_all,
+            "class_iou_old": rec.get("class_iou_old") if isinstance(rec.get("class_iou_old"), dict) else {},
+            "class_iou_new": rec.get("class_iou_new") if isinstance(rec.get("class_iou_new"), dict) else {},
+            "class_iou_bg": rec.get("class_iou_bg") if isinstance(rec.get("class_iou_bg"), dict) else {},
+        }
+        summaries[task_id] = payload
+    return summaries
+
+
 def _safe_float(value: object) -> Optional[float]:
     try:
         out = float(value)
@@ -268,6 +291,8 @@ def generate_analysis_artifacts(metrics_jsonl: Path, output_dir: Path, run_dir: 
             writer.writerow(row)
 
     eval_by_task = _read_task_eval_summaries(actual_run_dir)
+    if not eval_by_task:
+        eval_by_task = _read_task_eval_summaries_from_metrics(records)
     class_trends, group_rows = _build_class_trends(eval_by_task)
     class_trends_json.write_text(json.dumps(class_trends, indent=2), encoding="utf-8")
     group_trends_json.write_text(json.dumps(group_rows, indent=2), encoding="utf-8")
