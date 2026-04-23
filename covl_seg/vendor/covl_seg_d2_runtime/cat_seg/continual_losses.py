@@ -42,8 +42,13 @@ def kd_loss_on_class_indexes(
     student_selected = student_logits.index_select(dim=1, index=indexes)
     teacher_selected = teacher_logits.index_select(dim=1, index=indexes)
 
-    scaled_student = student_selected / temperature
-    scaled_teacher = teacher_selected / temperature
+    student_flat = student_selected.movedim(1, -1).reshape(-1, student_selected.shape[1])
+    teacher_flat = teacher_selected.movedim(1, -1).reshape(-1, teacher_selected.shape[1])
+    if student_flat.shape[0] == 0:
+        return zero_loss(student_logits.device)
+
+    scaled_student = student_flat / temperature
+    scaled_teacher = teacher_flat / temperature
     student_log_probs = F.log_softmax(scaled_student, dim=1)
     teacher_probs = F.softmax(scaled_teacher, dim=1)
     loss = F.kl_div(student_log_probs, teacher_probs, reduction="batchmean")

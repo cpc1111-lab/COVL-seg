@@ -7,6 +7,7 @@ from pathlib import Path
 
 import torch
 from torch import nn
+from torch.nn import functional as F
 
 
 def _load_runtime_continual_losses_module():
@@ -227,6 +228,34 @@ def test_kd_loss_on_class_indexes_is_finite_and_non_negative_for_valid_indexes()
     assert float(loss.item()) >= 0.0
 
 
+def test_kd_loss_on_class_indexes_matches_per_pixel_batchmean_for_4d_logits():
+    module = _load_runtime_continual_losses_module()
+
+    student_logits = torch.randn(2, 5, 4, 3)
+    teacher_logits = torch.randn(2, 5, 4, 3)
+    class_indexes = [1, 3, 4]
+    temperature = 2.5
+
+    loss = module.kd_loss_on_class_indexes(
+        student_logits=student_logits,
+        teacher_logits=teacher_logits,
+        class_indexes=class_indexes,
+        temperature=temperature,
+    )
+
+    student_selected = student_logits.index_select(dim=1, index=torch.tensor(class_indexes))
+    teacher_selected = teacher_logits.index_select(dim=1, index=torch.tensor(class_indexes))
+    student_flat = student_selected.permute(0, 2, 3, 1).reshape(-1, len(class_indexes))
+    teacher_flat = teacher_selected.permute(0, 2, 3, 1).reshape(-1, len(class_indexes))
+    expected = F.kl_div(
+        F.log_softmax(student_flat / temperature, dim=1),
+        F.softmax(teacher_flat / temperature, dim=1),
+        reduction="batchmean",
+    ) * (temperature ** 2)
+
+    assert torch.allclose(loss, expected, atol=1e-6, rtol=1e-6)
+
+
 def test_kd_loss_on_class_indexes_returns_zero_for_empty_indexes():
     module = _load_runtime_continual_losses_module()
 
@@ -315,6 +344,31 @@ def test_cat_seg_training_keeps_visible_mask_and_optional_ciba_ctr_paths(monkeyp
     assert "loss_ctr" in losses
     assert torch.isfinite(losses["loss_ciba"])
     assert torch.isfinite(losses["loss_ctr"])
+
+
+def test_cat_seg_training_tolerates_invalid_old_index_file_parse(monkeypatch, tmp_path):
+    module = _load_runtime_cat_seg_model_module(monkeypatch)
+    model = _build_runtime_training_model(module)
+
+    bad_indexes = tmp_path / "old_indexes_bad.json"
+    bad_indexes.write_text("{not valid json", encoding="utf-8")
+    loaded_old_indexes = module.load_visible_class_indexes(str(bad_indexes), num_classes=3)
+    model.old_class_indexes = [] if loaded_old_indexes is None else loaded_old_indexes.tolist()
+    model.lambda_old_kd = 0.7
+
+    checkpoint_path = tmp_path / "teacher_ok.pth"
+    teacher_state = {
+        f"sem_seg_head.{key}": value.clone()
+        for key, value in model.sem_seg_head.state_dict().items()
+    }
+    torch.save({"model": teacher_state}, checkpoint_path)
+    model.old_teacher_weights = str(checkpoint_path)
+
+    losses = model(_build_training_batch())
+
+    assert loaded_old_indexes is None
+    assert "loss_sem_seg" in losses
+    assert "loss_old_kd" not in losses
 
 
 def test_get_old_teacher_returns_none_for_empty_teacher_path(monkeypatch):

@@ -1,6 +1,5 @@
 # Copyright (c) Facebook, Inc. and its affiliates.
 import copy
-import json
 import logging
 from pathlib import Path
 from typing import List, Optional, Tuple
@@ -32,18 +31,6 @@ from .utils.class_masking import (
 
 _MINE_SAMPLE = 512
 _LOGGER = logging.getLogger(__name__)
-
-
-def _load_class_indexes(index_path: str) -> List[int]:
-    if not index_path:
-        return []
-    path = Path(index_path)
-    if not path.exists():
-        return []
-    data = json.loads(path.read_text(encoding="utf-8"))
-    if isinstance(data, list):
-        return [int(idx) for idx in data]
-    return []
 
 @META_ARCH_REGISTRY.register()
 class CATSeg(nn.Module):
@@ -94,12 +81,17 @@ class CATSeg(nn.Module):
         
         self.train_class_json = train_class_json
         self.test_class_json = test_class_json
-        self.visible_class_indexes = load_visible_class_indexes(
+        visible_indexes = load_visible_class_indexes(
             path_value=train_class_indexes,
             num_classes=int(self.sem_seg_head.num_classes),
         )
-        self.train_class_indexes = _load_class_indexes(train_class_indexes)
-        self.old_class_indexes = _load_class_indexes(train_old_class_indexes)
+        old_indexes = load_visible_class_indexes(
+            path_value=train_old_class_indexes,
+            num_classes=int(self.sem_seg_head.num_classes),
+        )
+        self.visible_class_indexes = visible_indexes
+        self.train_class_indexes = [] if visible_indexes is None else visible_indexes.tolist()
+        self.old_class_indexes = [] if old_indexes is None else old_indexes.tolist()
         self.old_teacher_weights = old_teacher_weights
         self.distill_temp = float(distill_temp)
         self.lambda_old_kd = float(lambda_old_kd)
