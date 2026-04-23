@@ -89,10 +89,11 @@ def clip_alignment_loss_on_class_indexes(
     text = F.normalize(text.float(), dim=-1)
 
     safe_scale = float(scale)
-    if not torch.isfinite(torch.tensor(safe_scale)) or safe_scale <= 0:
-        safe_scale = 1.0
+    if not torch.isfinite(torch.tensor(safe_scale)):
+        safe_scale = 0.0
+    safe_scale = max(safe_scale, 0.0)
 
-    similarity = safe_scale * (visual @ text.transpose(0, 1))
-    loss = F.softplus(-similarity).mean()
+    similarity = visual @ text.transpose(0, 1)
+    loss = (1.0 - similarity.mean()) * safe_scale
     loss = torch.nan_to_num(loss, nan=0.0, posinf=1e4, neginf=0.0)
     return loss.clamp_min(0.0)

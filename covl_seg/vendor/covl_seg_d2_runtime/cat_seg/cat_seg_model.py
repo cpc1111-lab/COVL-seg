@@ -388,19 +388,19 @@ class CATSeg(nn.Module):
                 visual_features = torch.cat((pixel_res3, pooled_res3), dim=0)
 
                 if self.old_class_indexes and self.lambda_old_clip > 0:
-                    losses["loss_old_clip"] = self.lambda_old_clip * clip_alignment_loss_on_class_indexes(
+                    losses["loss_old_clip"] = clip_alignment_loss_on_class_indexes(
                         visual_features=visual_features,
                         text_features=text_features,
                         class_indexes=self.old_class_indexes,
-                        scale=self.distill_temp,
+                        scale=self.lambda_old_clip,
                     )
 
                 if self.unseen_class_indexes and self.lambda_unseen_clip > 0:
-                    losses["loss_unseen_clip"] = self.lambda_unseen_clip * clip_alignment_loss_on_class_indexes(
+                    losses["loss_unseen_clip"] = clip_alignment_loss_on_class_indexes(
                         visual_features=visual_features,
                         text_features=text_features,
                         class_indexes=self.unseen_class_indexes,
-                        scale=self.distill_temp,
+                        scale=self.lambda_unseen_clip,
                     )
             return losses
 

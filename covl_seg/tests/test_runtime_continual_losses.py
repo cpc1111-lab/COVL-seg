@@ -351,6 +351,55 @@ def test_cat_seg_training_emits_old_kd_when_teacher_state_is_compatible(monkeypa
     assert torch.isfinite(losses["loss_old_kd"])
 
 
+def test_cat_seg_training_emits_old_clip_when_old_indexes_and_lambda_are_enabled(monkeypatch):
+    module = _load_runtime_cat_seg_model_module(monkeypatch)
+    model = _build_runtime_training_model(module)
+    model.old_class_indexes = [0, 1]
+    model.lambda_old_clip = 0.7
+    model.lambda_unseen_clip = 0.0
+
+    call_args = {}
+
+    def _fake_clip_alignment_loss(**kwargs):
+        call_args.update(kwargs)
+        return torch.tensor(0.25)
+
+    monkeypatch.setattr(module, "clip_alignment_loss_on_class_indexes", _fake_clip_alignment_loss)
+
+    losses = model(_build_training_batch())
+
+    assert "loss_old_clip" in losses
+    assert torch.isfinite(losses["loss_old_clip"])
+    assert torch.allclose(losses["loss_old_clip"], torch.tensor(0.25))
+    assert call_args["class_indexes"] == [0, 1]
+    assert call_args["scale"] == model.lambda_old_clip
+
+
+def test_cat_seg_training_emits_unseen_clip_when_unseen_indexes_and_lambda_are_enabled(monkeypatch):
+    module = _load_runtime_cat_seg_model_module(monkeypatch)
+    model = _build_runtime_training_model(module)
+    model.old_class_indexes = []
+    model.unseen_class_indexes = [2]
+    model.lambda_old_clip = 0.0
+    model.lambda_unseen_clip = 0.6
+
+    call_args = {}
+
+    def _fake_clip_alignment_loss(**kwargs):
+        call_args.update(kwargs)
+        return torch.tensor(0.5)
+
+    monkeypatch.setattr(module, "clip_alignment_loss_on_class_indexes", _fake_clip_alignment_loss)
+
+    losses = model(_build_training_batch())
+
+    assert "loss_unseen_clip" in losses
+    assert torch.isfinite(losses["loss_unseen_clip"])
+    assert torch.allclose(losses["loss_unseen_clip"], torch.tensor(0.5))
+    assert call_args["class_indexes"] == [2]
+    assert call_args["scale"] == model.lambda_unseen_clip
+
+
 def test_cat_seg_training_keeps_visible_mask_and_optional_ciba_ctr_paths(monkeypatch):
     module = _load_runtime_cat_seg_model_module(monkeypatch)
     model = _build_runtime_training_model(module)
