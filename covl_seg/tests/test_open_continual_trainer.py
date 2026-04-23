@@ -957,6 +957,63 @@ def test_trainer_d2_writes_task_conditioned_class_json_artifacts(tmp_path, monke
     assert overrides[overrides.index("MODEL.SEM_SEG_HEAD.TEST_CLASS_INDEXES") + 1] == str(test_indexes)
 
 
+def test_trainer_d2_pads_short_taxonomy_when_split_requires_more_classes(tmp_path, monkeypatch):
+    cfg = _write_mock_config(tmp_path)
+
+    def _fake_train(**kwargs):
+        out = kwargs["output_dir"]
+        out.mkdir(parents=True, exist_ok=True)
+        (out / "metrics.json").write_text('{"iteration":0,"total_loss":1.0}\n', encoding="utf-8")
+        return {"num_tasks": 1, "num_phase_records": 1, "last_task": 1}
+
+    def _fake_eval(**_kwargs):
+        return {"mIoU_all": 10.0, "mIoU_old": 9.0, "mIoU_new": 11.0, "BG-mIoU": 8.0}
+
+    monkeypatch.setattr("covl_seg.engine.open_continual_trainer.run_detectron2_train", _fake_train)
+    monkeypatch.setattr("covl_seg.engine.open_continual_trainer.run_detectron2_eval", _fake_eval)
+    monkeypatch.setattr(
+        "covl_seg.engine.open_continual_trainer._resolve_task_class_names",
+        lambda _cfg: ["person", "bicycle", "car"],
+    )
+
+    trainer = OpenContinualTrainer(
+        config_path=str(cfg),
+        output_dir=tmp_path / "run_d2_short_taxonomy",
+        engine="d2",
+        seed=0,
+        method_name="covl",
+        clip_finetune="attention",
+        task_spec=None,
+        num_tasks=1,
+        classes_per_task=150,
+        task_seed=0,
+        n_pre=1,
+        n_main=1,
+        eps_f=0.05,
+        t_mem="all",
+        mix_ratio=[3, 1],
+        m_max_total=100,
+        m_max_per_class=10,
+        ewc_lambda=10.0,
+        ewc_topk=4,
+        ewc_iters=10,
+        enable_ciba=True,
+        enable_ctr=True,
+        enable_spectral_ogp=True,
+        enable_sacr=True,
+    )
+
+    trainer.run()
+
+    split_dir = tmp_path / "run_d2_short_taxonomy" / "task_001" / "splits"
+    train_names = json.loads((split_dir / "train_class_names.json").read_text(encoding="utf-8"))
+    test_names = json.loads((split_dir / "test_class_names.json").read_text(encoding="utf-8"))
+    assert len(train_names) >= 150
+    assert len(test_names) >= 150
+    assert train_names[0] == "person"
+    assert train_names[149] == "class_149"
+
+
 def test_trainer_d2_hands_off_prior_task_checkpoint_via_model_weights(tmp_path, monkeypatch):
     cfg = _write_mock_config(tmp_path)
     class_names = [f"class_{idx}" for idx in range(150)]

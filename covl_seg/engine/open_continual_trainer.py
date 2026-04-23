@@ -81,17 +81,24 @@ def _write_task_class_artifacts(task_dir: Path, task: TaskDef, class_names: List
     test_class_names = split_dir / "test_class_names.json"
     required_indexes = set(task.seen_classes + task.new_classes + task.background_classes)
     max_index = max(required_indexes, default=-1)
-    if max_index >= len(class_names):
-        raise ValueError(
-            "Resolved class taxonomy is shorter than the task split indexes "
-            f"for task {task.task_id}: max_index={max_index}, taxonomy_size={len(class_names)}"
+    resolved_names = list(class_names)
+    if max_index >= len(resolved_names):
+        _log.warning(
+            "Resolved class taxonomy is shorter than task split indexes; "
+            "padding taxonomy with synthetic class names "
+            "for task %s (max_index=%s, taxonomy_size=%s)",
+            task.task_id,
+            max_index,
+            len(resolved_names),
         )
+        for idx in range(len(resolved_names), max_index + 1):
+            resolved_names.append(f"class_{idx}")
     train_class_names.write_text(
-        json.dumps(class_names, indent=2),
+        json.dumps(resolved_names, indent=2),
         encoding="utf-8",
     )
     test_class_names.write_text(
-        json.dumps(class_names, indent=2),
+        json.dumps(resolved_names, indent=2),
         encoding="utf-8",
     )
     return {
