@@ -33,7 +33,7 @@ class FusionHead(nn.Module):
                 align_corners=False,
             )
 
-        alpha_map = self.alpha + self.boundary_boost * boundary_map
+        alpha_map = self.alpha - self.boundary_boost * boundary_map
         alpha_map = alpha_map.clamp(0.0, 1.0)
 
         seg_log_prob = nn.functional.log_softmax(seg_logits, dim=1)

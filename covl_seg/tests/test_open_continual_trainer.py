@@ -1,6 +1,8 @@
 import json
+from pathlib import Path
 
 import pytest
+import torch
 
 from covl_seg.engine.detectron2_runner import _resolve_experiment_spec
 from covl_seg.engine.open_continual_trainer import OpenContinualTrainer, _resolve_task_class_names
@@ -66,6 +68,111 @@ def test_trainer_writes_plan_state_and_metrics(tmp_path, capsys):
     third = json.loads(metric_lines[2])
     assert "omega_tau_t" in third
     assert "alpha_star" in third
+    assert first["engine"] == "mock"
+    checkpoint = json.loads((tmp_path / "run" / "checkpoint_task_002.json").read_text(encoding="utf-8"))
+    mock_model_path = checkpoint["mock_model_path"]
+    assert Path(mock_model_path).exists()
+
+
+def test_trainer_mock_resume_restores_saved_model_state(tmp_path, monkeypatch):
+    cfg = _write_mock_config(tmp_path)
+    out_dir = tmp_path / "run_resume_mock_model"
+
+    first = OpenContinualTrainer(
+        config_path=str(cfg),
+        output_dir=out_dir,
+        engine="mock",
+        seed=0,
+        method_name="covl",
+        clip_finetune="attention",
+        task_spec=None,
+        num_tasks=2,
+        classes_per_task=2,
+        task_seed=0,
+        n_pre=1,
+        n_main=1,
+        eps_f=0.05,
+        t_mem="all",
+        mix_ratio=[3, 1],
+        m_max_total=100,
+        m_max_per_class=10,
+        ewc_lambda=10.0,
+        ewc_topk=4,
+        ewc_iters=10,
+        enable_ciba=True,
+        enable_ctr=True,
+        enable_spectral_ogp=True,
+        enable_sacr=True,
+    )
+    first.run(max_tasks=1)
+
+    checkpoint = json.loads((out_dir / "checkpoint_task_001.json").read_text(encoding="utf-8"))
+    mock_model_path = Path(checkpoint["mock_model_path"])
+    payload = torch.load(mock_model_path, map_location="cpu")
+    state_dict = payload["model_state_dict"]
+    param_key = next((k for k in state_dict.keys() if k.startswith("core_model.")), next(iter(state_dict.keys())))
+    state_dict[param_key] = torch.full_like(state_dict[param_key], 0.123)
+    payload["model_state_dict"] = state_dict
+    torch.save(payload, mock_model_path)
+
+    captured = {}
+
+    def _fake_run_mock_task_training(*, model, task, cfg, basis_history):
+        captured["task_id"] = task.task_id
+        captured["param"] = float(next(model.parameters()).detach().reshape(-1)[0].item())
+        next_basis = basis_history[0].detach().cpu().tolist() if basis_history else [0.1]
+        return model, {
+            "phase1": {"phase": "phase1", "task": float(task.task_id), "loss": 1.0, "beta_1_star": 0.1},
+            "phase2": {"phase": "phase2", "task": float(task.task_id), "loss": 2.0, "ctr_loss": 0.2},
+            "phase3": {
+                "phase": "phase3",
+                "task": float(task.task_id),
+                "loss": 3.0,
+                "alpha_star": 0.3,
+                "tau_pred": 0.4,
+                "subspace_basis": next_basis,
+            },
+            "phase4": {"phase": "phase4", "task": float(task.task_id), "loss": 4.0},
+        }
+
+    monkeypatch.setattr(
+        "covl_seg.engine.open_continual_trainer.run_mock_task_training",
+        _fake_run_mock_task_training,
+    )
+
+    resumed = OpenContinualTrainer(
+        config_path=str(cfg),
+        output_dir=out_dir,
+        engine="mock",
+        seed=0,
+        method_name="covl",
+        clip_finetune="attention",
+        task_spec=None,
+        num_tasks=2,
+        classes_per_task=2,
+        task_seed=0,
+        n_pre=1,
+        n_main=1,
+        eps_f=0.05,
+        t_mem="all",
+        mix_ratio=[3, 1],
+        m_max_total=100,
+        m_max_per_class=10,
+        ewc_lambda=10.0,
+        ewc_topk=4,
+        ewc_iters=10,
+        enable_ciba=True,
+        enable_ctr=True,
+        enable_spectral_ogp=True,
+        enable_sacr=True,
+        resume_task=1,
+    )
+    resumed.run(max_tasks=1)
+
+    assert captured["task_id"] == 2
+    assert captured["param"] == pytest.approx(0.123)
+    resumed_state = json.loads((out_dir / "continual_state.json").read_text(encoding="utf-8"))
+    assert "latest_mock_model_path" in resumed_state
 
 
 def test_trainer_mock_run_does_not_require_taxonomy_resolution(tmp_path, monkeypatch):
@@ -183,6 +290,88 @@ def test_trainer_resume_rejects_method_mismatch(tmp_path):
         enable_sacr=True,
     )
     with pytest.raises(ValueError):
+        trainer.run()
+
+
+def test_trainer_mock_resume_rejects_missing_state(tmp_path):
+    cfg = _write_mock_config(tmp_path)
+
+    trainer = OpenContinualTrainer(
+        config_path=str(cfg),
+        output_dir=tmp_path / "run_missing_state",
+        engine="mock",
+        seed=0,
+        method_name="covl",
+        clip_finetune="attention",
+        task_spec=None,
+        num_tasks=2,
+        classes_per_task=2,
+        task_seed=0,
+        n_pre=1,
+        n_main=1,
+        eps_f=0.05,
+        t_mem="all",
+        mix_ratio=[3, 1],
+        m_max_total=100,
+        m_max_per_class=10,
+        ewc_lambda=10.0,
+        ewc_topk=4,
+        ewc_iters=10,
+        enable_ciba=True,
+        enable_ctr=True,
+        enable_spectral_ogp=True,
+        enable_sacr=True,
+        resume_task=1,
+    )
+
+    with pytest.raises(ValueError, match="Mock resume requires prior continual state"):
+        trainer.run()
+
+
+def test_trainer_mock_resume_rejects_invalid_artifact_path(tmp_path):
+    cfg = _write_mock_config(tmp_path)
+    out = tmp_path / "run_invalid_mock_resume"
+    out.mkdir(parents=True, exist_ok=True)
+    (out / "continual_state.json").write_text(
+        json.dumps(
+            {
+                "current_task": 1,
+                "method": "covl",
+                "latest_mock_model_path": "missing_mock_model.pth",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    trainer = OpenContinualTrainer(
+        config_path=str(cfg),
+        output_dir=out,
+        engine="mock",
+        seed=0,
+        method_name="covl",
+        clip_finetune="attention",
+        task_spec=None,
+        num_tasks=2,
+        classes_per_task=2,
+        task_seed=0,
+        n_pre=1,
+        n_main=1,
+        eps_f=0.05,
+        t_mem="all",
+        mix_ratio=[3, 1],
+        m_max_total=100,
+        m_max_per_class=10,
+        ewc_lambda=10.0,
+        ewc_topk=4,
+        ewc_iters=10,
+        enable_ciba=True,
+        enable_ctr=True,
+        enable_spectral_ogp=True,
+        enable_sacr=True,
+        resume_task=1,
+    )
+
+    with pytest.raises(ValueError, match="valid mock model artifact"):
         trainer.run()
 
 
