@@ -16,3 +16,7 @@ def test_vendor_runtime_config_defines_covl_toggle_keys():
     assert "cfg.MODEL.COVL.ENABLE_CIBA" in text
     assert "cfg.MODEL.COVL.ENABLE_CTR" in text
     assert "cfg.MODEL.COVL.ENABLE_OGP" in text
+    assert "cfg.MODEL.SEM_SEG_HEAD.TRAIN_OLD_CLASS_INDEXES" in text
+    assert "cfg.MODEL.SEM_SEG_HEAD.OLD_TEACHER_WEIGHTS" in text
+    assert "cfg.MODEL.SEM_SEG_HEAD.DISTILL_TEMP" in text
+    assert "cfg.MODEL.SEM_SEG_HEAD.LAMBDA_OLD_KD" in text

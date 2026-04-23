@@ -1,5 +1,8 @@
 # Copyright (c) Facebook, Inc. and its affiliates.
-from typing import Tuple
+import copy
+import json
+from pathlib import Path
+from typing import List, Optional, Tuple
 
 import torch
 from torch import nn
@@ -14,6 +17,20 @@ from detectron2.structures import ImageList
 from detectron2.utils.memory import _ignore_torch_cuda_oom
 
 from einops import rearrange
+
+from .continual_losses import kd_loss_on_class_indexes
+
+
+def _load_class_indexes(index_path: str) -> List[int]:
+    if not index_path:
+        return []
+    path = Path(index_path)
+    if not path.exists():
+        return []
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if isinstance(data, list):
+        return [int(idx) for idx in data]
+    return []
 
 @META_ARCH_REGISTRY.register()
 class CATSeg(nn.Module):
@@ -30,6 +47,11 @@ class CATSeg(nn.Module):
         clip_pixel_std: Tuple[float],
         train_class_json: str,
         test_class_json: str,
+        train_class_indexes: str,
+        train_old_class_indexes: str,
+        old_teacher_weights: str,
+        distill_temp: float,
+        lambda_old_kd: float,
         sliding_window: bool,
         clip_finetune: str,
         backbone_multiplier: float,
@@ -53,6 +75,13 @@ class CATSeg(nn.Module):
         
         self.train_class_json = train_class_json
         self.test_class_json = test_class_json
+        self.train_class_indexes = _load_class_indexes(train_class_indexes)
+        self.old_class_indexes = _load_class_indexes(train_old_class_indexes)
+        self.old_teacher_weights = old_teacher_weights
+        self.distill_temp = float(distill_temp)
+        self.lambda_old_kd = float(lambda_old_kd)
+        self._old_teacher: Optional[nn.Module] = None
+        self._old_teacher_load_attempted = False
 
         self.clip_finetune = clip_finetune
         for name, params in self.sem_seg_head.predictor.clip_model.named_parameters():
@@ -102,6 +131,11 @@ class CATSeg(nn.Module):
             "clip_pixel_std": cfg.MODEL.CLIP_PIXEL_STD,
             "train_class_json": cfg.MODEL.SEM_SEG_HEAD.TRAIN_CLASS_JSON,
             "test_class_json": cfg.MODEL.SEM_SEG_HEAD.TEST_CLASS_JSON,
+            "train_class_indexes": cfg.MODEL.SEM_SEG_HEAD.TRAIN_CLASS_INDEXES,
+            "train_old_class_indexes": cfg.MODEL.SEM_SEG_HEAD.TRAIN_OLD_CLASS_INDEXES,
+            "old_teacher_weights": cfg.MODEL.SEM_SEG_HEAD.OLD_TEACHER_WEIGHTS,
+            "distill_temp": cfg.MODEL.SEM_SEG_HEAD.DISTILL_TEMP,
+            "lambda_old_kd": cfg.MODEL.SEM_SEG_HEAD.LAMBDA_OLD_KD,
             "sliding_window": cfg.TEST.SLIDING_WINDOW,
             "clip_finetune": cfg.MODEL.SEM_SEG_HEAD.CLIP_FINETUNE,
             "backbone_multiplier": cfg.SOLVER.BACKBONE_MULTIPLIER,
@@ -111,6 +145,36 @@ class CATSeg(nn.Module):
     @property
     def device(self):
         return self.pixel_mean.device
+
+    def _get_old_teacher(self) -> Optional[nn.Module]:
+        if self._old_teacher is not None:
+            return self._old_teacher
+        if self._old_teacher_load_attempted:
+            return None
+        self._old_teacher_load_attempted = True
+        if not self.old_teacher_weights:
+            return None
+
+        teacher_path = Path(self.old_teacher_weights)
+        if not teacher_path.exists():
+            return None
+
+        teacher = copy.deepcopy(self.sem_seg_head)
+        checkpoint = torch.load(teacher_path, map_location="cpu")
+        state_dict = checkpoint.get("model", checkpoint)
+        teacher_state = {
+            key.replace("sem_seg_head.", "", 1): value
+            for key, value in state_dict.items()
+            if key.startswith("sem_seg_head.")
+        }
+        load_state = teacher_state if teacher_state else state_dict
+        teacher.load_state_dict(load_state, strict=False)
+        teacher.to(self.device)
+        teacher.eval()
+        for param in teacher.parameters():
+            param.requires_grad = False
+        self._old_teacher = teacher
+        return self._old_teacher
     
     def forward(self, batched_inputs):
         """
@@ -160,17 +224,37 @@ class CATSeg(nn.Module):
         if self.training:
             targets = torch.stack([x["sem_seg"].to(self.device) for x in batched_inputs], dim=0)
             outputs = F.interpolate(outputs, size=(targets.shape[-2], targets.shape[-1]), mode="bilinear", align_corners=False)
+            student_outputs = outputs
+
+            teacher_outputs = None
+            old_teacher = self._get_old_teacher()
+            if old_teacher is not None and self.old_class_indexes:
+                with torch.no_grad():
+                    teacher_outputs = old_teacher(clip_features, features)
+                    teacher_outputs = F.interpolate(
+                        teacher_outputs,
+                        size=(targets.shape[-2], targets.shape[-1]),
+                        mode="bilinear",
+                        align_corners=False,
+                    )
             
-            num_classes = outputs.shape[1]
+            num_classes = student_outputs.shape[1]
             mask = targets != self.sem_seg_head.ignore_value
 
-            outputs = outputs.permute(0,2,3,1)
+            outputs = student_outputs.permute(0,2,3,1)
             _targets = torch.zeros(outputs.shape, device=self.device)
             _onehot = F.one_hot(targets[mask], num_classes=num_classes).float()
             _targets[mask] = _onehot
             
             loss = F.binary_cross_entropy_with_logits(outputs, _targets)
             losses = {"loss_sem_seg" : loss}
+            if teacher_outputs is not None and self.lambda_old_kd > 0:
+                losses["loss_old_kd"] = self.lambda_old_kd * kd_loss_on_class_indexes(
+                    student_logits=student_outputs,
+                    teacher_logits=teacher_outputs,
+                    class_indexes=self.old_class_indexes,
+                    temperature=self.distill_temp,
+                )
             return losses
 
         else:
