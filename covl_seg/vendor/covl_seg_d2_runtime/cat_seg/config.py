@@ -30,6 +30,10 @@ def add_cat_seg_config(cfg):
 
     # mask_former model config
     cfg.MODEL.MASK_FORMER = CN()
+    cfg.MODEL.COVL = CN()
+    cfg.MODEL.COVL.ENABLE_CIBA = False
+    cfg.MODEL.COVL.ENABLE_CTR = False
+    cfg.MODEL.COVL.ENABLE_OGP = False
 
     # Sometimes `backbone.size_divisibility` is set to 0 for some backbone (e.g. ResNet)
     # you can use this config to override
