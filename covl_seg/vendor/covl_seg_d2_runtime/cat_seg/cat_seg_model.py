@@ -1,5 +1,8 @@
 # Copyright (c) Facebook, Inc. and its affiliates.
-from typing import Tuple
+import copy
+import logging
+from pathlib import Path
+from typing import List, Optional, Tuple
 
 import torch
 from torch import nn
@@ -14,6 +17,23 @@ from detectron2.structures import ImageList
 from detectron2.utils.memory import _ignore_torch_cuda_oom
 
 from einops import rearrange
+
+from covl_seg.losses.ciba import ciba_alignment_loss
+from covl_seg.losses.ctr import ctr_background_loss
+from covl_seg.losses.mine import MINECritic, mine_lower_bound
+
+from .continual_losses import (
+    clip_alignment_loss_on_class_indexes,
+    kd_loss_on_class_indexes,
+)
+from .utils.class_masking import (
+    load_visible_class_indexes,
+    mask_logits_and_targets_to_visible_classes,
+)
+
+
+_MINE_SAMPLE = 512
+_LOGGER = logging.getLogger(__name__)
 
 @META_ARCH_REGISTRY.register()
 class CATSeg(nn.Module):
@@ -30,6 +50,20 @@ class CATSeg(nn.Module):
         clip_pixel_std: Tuple[float],
         train_class_json: str,
         test_class_json: str,
+        train_class_indexes: str,
+        train_old_class_indexes: str,
+        train_unseen_class_indexes: str,
+        old_teacher_weights: str,
+        distill_temp: float,
+        lambda_old_kd: float,
+        lambda_old_clip: float,
+        lambda_unseen_clip: float,
+        enable_ciba: bool = False,
+        enable_ctr: bool = False,
+        beta_star: float = 0.0,
+        gamma_clip: float = 0.0,
+        lambda0_ctr: float = 0.1,
+        background_ids: List[int] = (),
         sliding_window: bool,
         clip_finetune: str,
         backbone_multiplier: float,
@@ -53,6 +87,36 @@ class CATSeg(nn.Module):
         
         self.train_class_json = train_class_json
         self.test_class_json = test_class_json
+        visible_indexes = load_visible_class_indexes(
+            path_value=train_class_indexes,
+            num_classes=int(self.sem_seg_head.num_classes),
+        )
+        old_indexes = load_visible_class_indexes(
+            path_value=train_old_class_indexes,
+            num_classes=int(self.sem_seg_head.num_classes),
+        )
+        unseen_indexes = load_visible_class_indexes(
+            path_value=train_unseen_class_indexes,
+            num_classes=int(self.sem_seg_head.num_classes),
+        )
+        self.visible_class_indexes = visible_indexes
+        self.train_class_indexes = [] if visible_indexes is None else visible_indexes.tolist()
+        self.old_class_indexes = [] if old_indexes is None else old_indexes.tolist()
+        self.unseen_class_indexes = [] if unseen_indexes is None else unseen_indexes.tolist()
+        self.old_teacher_weights = old_teacher_weights
+        self.distill_temp = float(distill_temp)
+        self.lambda_old_kd = float(lambda_old_kd)
+        self.lambda_old_clip = float(lambda_old_clip)
+        self.lambda_unseen_clip = float(lambda_unseen_clip)
+        self._old_teacher: Optional[nn.Module] = None
+        self._old_teacher_load_attempted = False
+
+        self.enable_ciba = bool(enable_ciba)
+        self.enable_ctr = bool(enable_ctr)
+        self.beta_star = float(beta_star)
+        self.gamma_clip = float(gamma_clip)
+        self.lambda0_ctr = float(lambda0_ctr)
+        self.background_ids = list(background_ids)
 
         self.clip_finetune = clip_finetune
         for name, params in self.sem_seg_head.predictor.clip_model.named_parameters():
@@ -80,6 +144,7 @@ class CATSeg(nn.Module):
         self.proj_dim = 768 if clip_pretrained == "ViT-B/16" else 1024
         self.upsample1 = nn.ConvTranspose2d(self.proj_dim, 256, kernel_size=2, stride=2)
         self.upsample2 = nn.ConvTranspose2d(self.proj_dim, 128, kernel_size=4, stride=4)
+        self.mine_critic = MINECritic(feature_dim=self.proj_dim) if self.enable_ciba else None
 
         self.layer_indexes = [3, 7] if clip_pretrained == "ViT-B/16" else [7, 15] 
         self.layers = []
@@ -102,6 +167,24 @@ class CATSeg(nn.Module):
             "clip_pixel_std": cfg.MODEL.CLIP_PIXEL_STD,
             "train_class_json": cfg.MODEL.SEM_SEG_HEAD.TRAIN_CLASS_JSON,
             "test_class_json": cfg.MODEL.SEM_SEG_HEAD.TEST_CLASS_JSON,
+            "train_class_indexes": cfg.MODEL.SEM_SEG_HEAD.TRAIN_CLASS_INDEXES,
+            "train_old_class_indexes": cfg.MODEL.SEM_SEG_HEAD.TRAIN_OLD_CLASS_INDEXES,
+            "train_unseen_class_indexes": getattr(
+                cfg.MODEL.SEM_SEG_HEAD,
+                "TRAIN_UNSEEN_CLASS_INDEXES",
+                "",
+            ),
+            "old_teacher_weights": cfg.MODEL.SEM_SEG_HEAD.OLD_TEACHER_WEIGHTS,
+            "distill_temp": cfg.MODEL.SEM_SEG_HEAD.DISTILL_TEMP,
+            "lambda_old_kd": cfg.MODEL.SEM_SEG_HEAD.LAMBDA_OLD_KD,
+            "lambda_old_clip": getattr(cfg.MODEL.SEM_SEG_HEAD, "LAMBDA_OLD_CLIP", 0.0),
+            "lambda_unseen_clip": getattr(cfg.MODEL.SEM_SEG_HEAD, "LAMBDA_UNSEEN_CLIP", 0.0),
+            "enable_ciba": cfg.MODEL.COVL.ENABLE_CIBA,
+            "enable_ctr": cfg.MODEL.COVL.ENABLE_CTR,
+            "beta_star": getattr(cfg.MODEL.COVL, "BETA_STAR", 0.0),
+            "gamma_clip": getattr(cfg.MODEL.COVL, "GAMMA_CLIP", 0.0),
+            "lambda0_ctr": getattr(cfg.MODEL.COVL, "LAMBDA0_CTR", 0.1),
+            "background_ids": list(getattr(cfg.MODEL.COVL, "BACKGROUND_IDS", [])),
             "sliding_window": cfg.TEST.SLIDING_WINDOW,
             "clip_finetune": cfg.MODEL.SEM_SEG_HEAD.CLIP_FINETUNE,
             "backbone_multiplier": cfg.SOLVER.BACKBONE_MULTIPLIER,
@@ -111,6 +194,96 @@ class CATSeg(nn.Module):
     @property
     def device(self):
         return self.pixel_mean.device
+
+    def _get_text_features(self) -> torch.Tensor:
+        text_feats = self.sem_seg_head.predictor.text_features
+        return F.normalize(text_feats.to(self.device), dim=-1)
+
+    def _compute_ciba_loss(self, res3: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        _, channels, height, width = res3.shape
+        projected = res3.permute(0, 2, 3, 1).reshape(-1, channels)
+        targets_small = F.interpolate(
+            targets.float().unsqueeze(1), size=(height, width), mode="nearest"
+        ).squeeze(1).long()
+
+        try:
+            text_feats = self._get_text_features()
+        except AttributeError:
+            return torch.tensor(0.0, device=self.device)
+
+        valid = (targets_small != self.sem_seg_head.ignore_value).reshape(-1)
+        if int(valid.sum().item()) <= 1:
+            return torch.tensor(0.0, device=self.device)
+
+        projected_valid = projected[valid]
+        classes_valid = targets_small.reshape(-1)[valid].clamp(0, text_feats.shape[0] - 1)
+        text_valid = text_feats[classes_valid]
+
+        sample_count = min(_MINE_SAMPLE, projected_valid.shape[0])
+        sample_indexes = torch.randperm(projected_valid.shape[0], device=self.device)[:sample_count]
+        projected_sample = projected_valid[sample_indexes]
+        text_sample = text_valid[sample_indexes]
+
+        mi_est = mine_lower_bound(self.mine_critic, projected_sample, text_sample)
+        return ciba_alignment_loss(projected_sample, text_sample, mi_est, self.beta_star)
+
+    def _compute_ctr_loss(self, res3: torch.Tensor) -> torch.Tensor:
+        _, channels, _, _ = res3.shape
+        projected = res3.permute(0, 2, 3, 1).reshape(-1, channels)
+
+        try:
+            text_feats = self._get_text_features()
+        except AttributeError:
+            return torch.tensor(0.0, device=self.device)
+
+        bg_ids = torch.tensor(self.background_ids, device=self.device, dtype=torch.long)
+        sample_count = min(_MINE_SAMPLE, projected.shape[0])
+        sample_indexes = torch.randperm(projected.shape[0], device=self.device)[:sample_count]
+        return ctr_background_loss(
+            projected[sample_indexes],
+            text_feats,
+            bg_ids,
+            self.gamma_clip,
+            self.lambda0_ctr,
+        )
+
+    def _get_old_teacher(self) -> Optional[nn.Module]:
+        if self._old_teacher is not None:
+            return self._old_teacher
+        if self._old_teacher_load_attempted:
+            return None
+        self._old_teacher_load_attempted = True
+        if not self.old_teacher_weights:
+            return None
+
+        teacher_path = Path(self.old_teacher_weights)
+        if not teacher_path.exists():
+            return None
+
+        teacher = copy.deepcopy(self.sem_seg_head)
+        checkpoint = torch.load(teacher_path, map_location="cpu")
+        state_dict = checkpoint.get("model", checkpoint)
+        teacher_state = {
+            key.replace("sem_seg_head.", "", 1): value
+            for key, value in state_dict.items()
+            if key.startswith("sem_seg_head.")
+        }
+        load_state = teacher_state if teacher_state else state_dict
+        try:
+            teacher.load_state_dict(load_state, strict=True)
+        except RuntimeError as exc:
+            _LOGGER.warning(
+                "Skipping old teacher load from %s due to strict state mismatch: %s",
+                teacher_path,
+                exc,
+            )
+            return None
+        teacher.to(self.device)
+        teacher.eval()
+        for param in teacher.parameters():
+            param.requires_grad = False
+        self._old_teacher = teacher
+        return self._old_teacher
     
     def forward(self, batched_inputs):
         """
@@ -160,17 +333,75 @@ class CATSeg(nn.Module):
         if self.training:
             targets = torch.stack([x["sem_seg"].to(self.device) for x in batched_inputs], dim=0)
             outputs = F.interpolate(outputs, size=(targets.shape[-2], targets.shape[-1]), mode="bilinear", align_corners=False)
+            student_outputs = outputs
+
+            teacher_outputs = None
+            old_teacher = self._get_old_teacher()
+            if old_teacher is not None and self.old_class_indexes:
+                with torch.no_grad():
+                    teacher_outputs = old_teacher(clip_features, features)
+                    teacher_outputs = F.interpolate(
+                        teacher_outputs,
+                        size=(targets.shape[-2], targets.shape[-1]),
+                        mode="bilinear",
+                        align_corners=False,
+                    )
             
-            num_classes = outputs.shape[1]
+            num_classes = student_outputs.shape[1]
             mask = targets != self.sem_seg_head.ignore_value
 
-            outputs = outputs.permute(0,2,3,1)
+            outputs = student_outputs.permute(0,2,3,1)
             _targets = torch.zeros(outputs.shape, device=self.device)
             _onehot = F.one_hot(targets[mask], num_classes=num_classes).float()
             _targets[mask] = _onehot
+
+            outputs, _targets = mask_logits_and_targets_to_visible_classes(
+                logits=outputs,
+                targets=_targets,
+                visible_class_indexes=self.visible_class_indexes,
+            )
             
             loss = F.binary_cross_entropy_with_logits(outputs, _targets)
             losses = {"loss_sem_seg" : loss}
+            if self.enable_ciba and self.mine_critic is not None:
+                losses["loss_ciba"] = self._compute_ciba_loss(res3, targets)
+
+            if self.enable_ctr and self.background_ids:
+                losses["loss_ctr"] = self._compute_ctr_loss(res3)
+
+            if teacher_outputs is not None and self.lambda_old_kd > 0:
+                losses["loss_old_kd"] = self.lambda_old_kd * kd_loss_on_class_indexes(
+                    student_logits=student_outputs,
+                    teacher_logits=teacher_outputs,
+                    class_indexes=self.old_class_indexes,
+                    temperature=self.distill_temp,
+                )
+
+            try:
+                text_features = self._get_text_features()
+            except AttributeError:
+                text_features = None
+
+            if text_features is not None:
+                pooled_res3 = res3.mean(dim=(2, 3))
+                pixel_res3 = res3.movedim(1, -1).reshape(-1, res3.shape[1])
+                visual_features = torch.cat((pixel_res3, pooled_res3), dim=0)
+
+                if self.old_class_indexes and self.lambda_old_clip > 0:
+                    losses["loss_old_clip"] = clip_alignment_loss_on_class_indexes(
+                        visual_features=visual_features,
+                        text_features=text_features,
+                        class_indexes=self.old_class_indexes,
+                        scale=self.lambda_old_clip,
+                    )
+
+                if self.unseen_class_indexes and self.lambda_unseen_clip > 0:
+                    losses["loss_unseen_clip"] = clip_alignment_loss_on_class_indexes(
+                        visual_features=visual_features,
+                        text_features=text_features,
+                        class_indexes=self.unseen_class_indexes,
+                        scale=self.lambda_unseen_clip,
+                    )
             return losses
 
         else:

@@ -82,17 +82,24 @@ def _write_task_class_artifacts(task_dir: Path, task: TaskDef, class_names: List
     test_class_names = split_dir / "test_class_names.json"
     required_indexes = set(task.seen_classes + task.new_classes + task.background_classes)
     max_index = max(required_indexes, default=-1)
-    if max_index >= len(class_names):
-        raise ValueError(
-            "Resolved class taxonomy is shorter than the task split indexes "
-            f"for task {task.task_id}: max_index={max_index}, taxonomy_size={len(class_names)}"
+    resolved_names = list(class_names)
+    if max_index >= len(resolved_names):
+        _log.warning(
+            "Resolved class taxonomy is shorter than task split indexes; "
+            "padding taxonomy with synthetic class names "
+            "for task %s (max_index=%s, taxonomy_size=%s)",
+            task.task_id,
+            max_index,
+            len(resolved_names),
         )
+        for idx in range(len(resolved_names), max_index + 1):
+            resolved_names.append(f"class_{idx}")
     train_class_names.write_text(
-        json.dumps(class_names, indent=2),
+        json.dumps(resolved_names, indent=2),
         encoding="utf-8",
     )
     test_class_names.write_text(
-        json.dumps(class_names, indent=2),
+        json.dumps(resolved_names, indent=2),
         encoding="utf-8",
     )
     return {
@@ -306,6 +313,17 @@ def _estimate_beta_star_from_train(rows: List[Dict[str, float]]) -> Optional[flo
     variance = sum((x - mean_loss) ** 2 for x in losses) / len(losses)
     std = math.sqrt(max(variance, 0.0))
     return float(max(0.0, std / (mean_loss + 1e-8)))
+
+
+def _summarize_train_loss_fields(rows: List[Dict[str, float]]) -> Dict[str, Optional[float]]:
+    return {
+        "loss_sem_seg": _mean_from_keys(rows, ["loss_sem_seg"]),
+        "loss_old_kd": _mean_from_keys(rows, ["loss_old_kd"]),
+        "loss_old_clip": _mean_from_keys(rows, ["loss_old_clip"]),
+        "loss_unseen_clip": _mean_from_keys(rows, ["loss_unseen_clip"]),
+        "loss_ciba": _mean_from_keys(rows, ["loss_ciba"]),
+        "loss_ctr": _mean_from_keys(rows, ["loss_ctr", "ctr_loss"]),
+    }
 
 
 def _compute_class_iou_overlap(
@@ -994,6 +1012,12 @@ class OpenContinualTrainer:
                     str(class_artifacts["test_indexes"].resolve()),
                     "MODEL.SEM_SEG_HEAD.OLD_TEACHER_WEIGHTS",
                     "",
+                    "MODEL.COVL.ENABLE_CIBA",
+                    str(bool(self.enable_ciba)),
+                    "MODEL.COVL.ENABLE_CTR",
+                    str(bool(self.enable_ctr)),
+                    "MODEL.COVL.ENABLE_OGP",
+                    str(bool(self.enable_spectral_ogp)),
                     "MODEL.SEM_SEG_HEAD.LAMBDA_OLD_KD",
                     str(float(self.lambda_old_kd)),
                     "MODEL.SEM_SEG_HEAD.LAMBDA_OLD_CLIP",
@@ -1129,6 +1153,7 @@ class OpenContinualTrainer:
                     bg_avg = _mean_metric_map(bg_map)
 
                     train_rows = _read_d2_metrics(task_dir)
+                    loss_summary = _summarize_train_loss_fields(train_rows)
                     real_beta = _estimate_beta_star_from_train(train_rows)
                     real_ctr = _mean_from_keys(train_rows, ["loss_ctr", "ctr_loss", "loss_contrastive"])
                     real_alpha = None
@@ -1160,6 +1185,25 @@ class OpenContinualTrainer:
                             "tau_pred": _safe_float(real_continual.get("tau_pred")),
                             "omega_tau_t": _safe_float(real_continual.get("omega_tau_t")),
                             "engine": "d2",
+                        },
+                    )
+                    append_metrics_jsonl(
+                        self._metrics_path(),
+                        {
+                            "task": float(task.task_id),
+                            "phase": "task_summary",
+                            "engine": "d2",
+                            "beta_1_star": _safe_float(real_continual.get("beta_1_star")),
+                            "ctr_loss": _safe_float(real_continual.get("ctr_loss")),
+                            "alpha_star": _safe_float(real_continual.get("alpha_star")),
+                            "tau_pred": _safe_float(real_continual.get("tau_pred")),
+                            "omega_tau_t": _safe_float(real_continual.get("omega_tau_t")),
+                            "loss_sem_seg": _safe_float(loss_summary.get("loss_sem_seg")),
+                            "loss_old_kd": _safe_float(loss_summary.get("loss_old_kd")),
+                            "loss_old_clip": _safe_float(loss_summary.get("loss_old_clip")),
+                            "loss_unseen_clip": _safe_float(loss_summary.get("loss_unseen_clip")),
+                            "loss_ciba": _safe_float(loss_summary.get("loss_ciba")),
+                            "loss_ctr": _safe_float(loss_summary.get("loss_ctr")),
                         },
                     )
                     if isinstance(class_iou_all, dict) and class_iou_all:

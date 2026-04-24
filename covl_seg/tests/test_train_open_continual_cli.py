@@ -94,6 +94,34 @@ def test_parser_defaults_to_ten_tasks_and_long_main_phase():
     assert args.n_main == 10000
 
 
+def test_parser_accepts_real_continual_loss_args():
+    parser = build_parser()
+    args = parser.parse_args(
+        [
+            "--config",
+            "covl_seg/configs/covl_seg_vitb_coco.yaml",
+            "--output-dir",
+            "work_dirs/dev",
+            "--lambda-old-kd",
+            "1.5",
+            "--lambda-old-clip",
+            "0.3",
+            "--lambda-unseen-clip",
+            "0.25",
+            "--disable-ciba",
+            "--enable-ctr",
+            "--enable-spectral-ogp",
+        ]
+    )
+
+    assert args.lambda_old_kd == 1.5
+    assert args.lambda_old_clip == 0.3
+    assert args.lambda_unseen_clip == 0.25
+    assert args.enable_ciba is False
+    assert args.enable_ctr is True
+    assert args.enable_spectral_ogp is True
+
+
 def test_main_d2_bootstraps_datasets(monkeypatch, tmp_path):
     from covl_seg.scripts import train_open_continual as script
 

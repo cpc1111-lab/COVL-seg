@@ -30,6 +30,10 @@ def add_cat_seg_config(cfg):
 
     # mask_former model config
     cfg.MODEL.MASK_FORMER = CN()
+    cfg.MODEL.COVL = CN()
+    cfg.MODEL.COVL.ENABLE_CIBA = False
+    cfg.MODEL.COVL.ENABLE_CTR = False
+    cfg.MODEL.COVL.ENABLE_OGP = False
 
     # Sometimes `backbone.size_divisibility` is set to 0 for some backbone (e.g. ResNet)
     # you can use this config to override
@@ -57,7 +61,14 @@ def add_cat_seg_config(cfg):
     cfg.MODEL.SEM_SEG_HEAD.TRAIN_CLASS_JSON = "datasets/ADE20K_2021_17_01/ADE20K_847.json"
     cfg.MODEL.SEM_SEG_HEAD.TEST_CLASS_JSON = "datasets/ADE20K_2021_17_01/ADE20K_847.json"
     cfg.MODEL.SEM_SEG_HEAD.TRAIN_CLASS_INDEXES = "datasets/coco/coco_stuff/split/seen_indexes.json"
+    cfg.MODEL.SEM_SEG_HEAD.TRAIN_OLD_CLASS_INDEXES = ""
+    cfg.MODEL.SEM_SEG_HEAD.TRAIN_UNSEEN_CLASS_INDEXES = ""
     cfg.MODEL.SEM_SEG_HEAD.TEST_CLASS_INDEXES = "datasets/coco/coco_stuff/split/unseen_indexes.json"
+    cfg.MODEL.SEM_SEG_HEAD.OLD_TEACHER_WEIGHTS = ""
+    cfg.MODEL.SEM_SEG_HEAD.DISTILL_TEMP = 1.0
+    cfg.MODEL.SEM_SEG_HEAD.LAMBDA_OLD_KD = 1.0
+    cfg.MODEL.SEM_SEG_HEAD.LAMBDA_OLD_CLIP = 0.0
+    cfg.MODEL.SEM_SEG_HEAD.LAMBDA_UNSEEN_CLIP = 0.0
 
     cfg.MODEL.SEM_SEG_HEAD.CLIP_PRETRAINED = "ViT-B/16"
 
