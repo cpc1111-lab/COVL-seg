@@ -80,6 +80,20 @@ def test_parser_accepts_balanced_controller_args():
     assert args.epsilon_ov == 0.13
 
 
+def test_parser_defaults_to_ten_tasks_and_long_main_phase():
+    parser = build_parser()
+    args = parser.parse_args(
+        [
+            "--config",
+            "covl_seg/configs/covl_seg_vitb_ade15.yaml",
+            "--output-dir",
+            "work_dirs/dev",
+        ]
+    )
+    assert args.num_tasks == 10
+    assert args.n_main == 10000
+
+
 def test_main_d2_bootstraps_datasets(monkeypatch, tmp_path):
     from covl_seg.scripts import train_open_continual as script
 

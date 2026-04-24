@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Dict, List, Sequence, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import torch
 from torch import nn
@@ -151,11 +151,32 @@ def _build_replay_batch(outputs: Dict[str, torch.Tensor], targets: torch.Tensor,
     }
 
 
+def _emit_progress(
+    progress_callback: Optional[Callable[[Dict[str, object]], None]],
+    *,
+    phase: str,
+    current: int,
+    total: int,
+    message: Optional[str] = None,
+) -> None:
+    if progress_callback is None:
+        return
+    payload: Dict[str, object] = {
+        "phase": phase,
+        "current": int(current),
+        "total": int(max(total, 1)),
+    }
+    if message:
+        payload["message"] = message
+    progress_callback(payload)
+
+
 def run_mock_task_training(
     model: nn.Module,
     task: TaskDef,
     cfg: Dict[str, object],
     basis_history: Sequence[Sequence[float]],
+    progress_callback: Optional[Callable[[Dict[str, object]], None]] = None,
 ) -> Tuple[nn.Module, Dict[str, Dict[str, object]]]:
     core_model = getattr(model, "core_model", model)
     text_embeddings = getattr(model, "text_embeddings", None)
@@ -184,7 +205,8 @@ def run_mock_task_training(
 
     core_model.train()
     model_device = next(core_model.parameters()).device
-    for _ in range(n_pre):
+    _emit_progress(progress_callback, phase="phase1", current=0, total=n_pre, message="phase1 start")
+    for step in range(n_pre):
         batch = _make_synthetic_batch(
             task,
             int(text_embeddings.shape[0]),
@@ -227,6 +249,12 @@ def run_mock_task_training(
 
         phase1_losses.append(float(loss.item()))
         phase1_ciba_losses.append(float(ciba_loss.item()))
+        _emit_progress(
+            progress_callback,
+            phase="phase1",
+            current=step + 1,
+            total=n_pre,
+        )
 
     cfg_with_history = dict(cfg)
     cfg_with_history["_basis_history"] = [list(v) for v in basis_history]
@@ -238,7 +266,8 @@ def run_mock_task_training(
     proj_before: List[float] = []
     proj_after: List[float] = []
 
-    for _ in range(n_main):
+    _emit_progress(progress_callback, phase="phase2", current=0, total=n_main, message="phase2 start")
+    for step in range(n_main):
         batch = _make_synthetic_batch(
             task,
             int(text_embeddings.shape[0]),
@@ -290,6 +319,12 @@ def run_mock_task_training(
         last_phase2_outputs = outputs
         last_phase2_targets = targets
         last_bg_logits = bg_logits
+        _emit_progress(
+            progress_callback,
+            phase="phase2",
+            current=step + 1,
+            total=n_main,
+        )
 
     denom = max(i_exc_c + i_exc_s, 1e-8)
     alpha_floor = float(cfg.get("balanced_alpha_floor", 0.0))
@@ -310,9 +345,27 @@ def run_mock_task_training(
         "fisher_energy": fisher_energy,
         "loss": float(max(1e-6, 1.0 / (1.0 + fisher_energy))),
     }
+    _emit_progress(progress_callback, phase="phase3", current=1, total=1)
 
     replay_batch = _build_replay_batch(last_phase2_outputs, last_phase2_targets, last_bg_logits)
     phase4 = run_phase4_replay_update(task.task_id, cfg, batch=replay_batch)
+    _emit_progress(progress_callback, phase="phase4", current=1, total=1)
+
+    infer_batch = _make_synthetic_batch(
+        task,
+        int(text_embeddings.shape[0]),
+        batch_size=max(1, min(batch_size, 2)),
+        image_size=image_size,
+        generator=generator,
+        use_seen_classes=True,
+    )
+    with torch.no_grad():
+        _ = core_model(
+            images=infer_batch["images"].to(model_device),
+            text_embeddings=text_embeddings,
+            targets=None,
+        )["logits"]
+    _emit_progress(progress_callback, phase="infer", current=1, total=1)
 
     phase1 = {
         "phase": "phase1",

@@ -72,6 +72,8 @@ def test_run_detectron2_train_invokes_catseg_train_net(monkeypatch, tmp_path: Pa
     assert "MODEL.WEIGHTS" in cmd
     assert cmd[cmd.index("MODEL.WEIGHTS") + 1] == str(prior_weights)
     assert calls[0]["env"]["DETECTRON2_DATASETS"] == str(d2_runner._workspace_root() / "datasets")
+    py_path = calls[0]["env"].get("PYTHONPATH", "")
+    assert str(d2_runner._workspace_root()) in py_path.split(":")
     metrics_lines = (out_dir / "metrics.jsonl").read_text(encoding="utf-8").strip().splitlines()
     assert len(metrics_lines) == 2
     first = json.loads(metrics_lines[0])

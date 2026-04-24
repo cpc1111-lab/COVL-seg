@@ -7,7 +7,7 @@ import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional
 
 import torch
 from torch import nn
@@ -31,6 +31,7 @@ from covl_seg.engine.detectron2_runner import (
     run_detectron2_eval,
     run_detectron2_train,
 )
+from covl_seg.engine.evaluator import compute_basic_miou
 from covl_seg.engine.hooks import append_metrics_jsonl
 from covl_seg.engine.mock_continual_runner import infer_num_classes_from_config as _infer_num_classes_from_config_mock
 from covl_seg.engine.mock_training_loop import run_mock_task_training
@@ -330,6 +331,135 @@ def _compute_class_iou_overlap(
     return best
 
 
+def _build_mock_rgb_palette(num_classes: int) -> torch.Tensor:
+    idx = torch.arange(num_classes, dtype=torch.float32)
+    return torch.stack([torch.sin(idx), torch.cos(idx), torch.tanh(idx / 10.0)], dim=1)
+
+
+def _sample_mock_eval_batch(
+    task: TaskDef,
+    num_classes: int,
+    batch_size: int,
+    image_size: int,
+    seed: int,
+) -> Dict[str, torch.Tensor]:
+    generator = torch.Generator().manual_seed(seed)
+    seen = [int(x) for x in task.seen_classes] or [0]
+    class_pool = torch.tensor(seen, dtype=torch.long)
+    sampled = torch.randint(0, class_pool.shape[0], (batch_size, image_size, image_size), generator=generator)
+    targets = class_pool[sampled]
+    palette = _build_mock_rgb_palette(num_classes=num_classes)
+    images = palette[targets] + 0.05 * torch.randn(batch_size, image_size, image_size, 3, generator=generator)
+    images = images.permute(0, 3, 1, 2).contiguous().float()
+    return {"images": images, "targets": targets.long()}
+
+
+def _compute_mock_task_eval_metrics(
+    model: nn.Module,
+    task: TaskDef,
+    num_classes: int,
+    seed: int,
+    batches: int = 2,
+) -> Dict[str, float]:
+    core_model = getattr(model, "core_model", model)
+    text_embeddings = getattr(model, "text_embeddings", None)
+    if text_embeddings is None:
+        return {"mIoU_all": 0.0, "mIoU_old": 0.0, "mIoU_new": 0.0, "BG-mIoU": 0.0}
+
+    device = next(core_model.parameters()).device
+    old_classes = [int(c) for c in task.seen_classes if int(c) not in {int(x) for x in task.new_classes}]
+    new_classes = [int(x) for x in task.new_classes]
+    bg_classes = [int(x) for x in task.background_classes]
+
+    vals_all: List[float] = []
+    vals_old: List[float] = []
+    vals_new: List[float] = []
+    vals_bg: List[float] = []
+
+    core_model.eval()
+    with torch.no_grad():
+        for idx in range(max(1, batches)):
+            batch = _sample_mock_eval_batch(
+                task=task,
+                num_classes=num_classes,
+                batch_size=2,
+                image_size=32,
+                seed=seed + idx,
+            )
+            images = batch["images"].to(device)
+            targets = batch["targets"].to(device)
+            logits = core_model(images=images, text_embeddings=text_embeddings, targets=None)["logits"]
+            pred = logits.argmax(dim=1)
+
+            vals_all.append(compute_basic_miou(pred=pred, target=targets, num_classes=num_classes))
+            if old_classes:
+                vals_old.append(compute_basic_miou(pred=pred, target=targets, num_classes=max(old_classes) + 1))
+            if new_classes:
+                vals_new.append(compute_basic_miou(pred=pred, target=targets, num_classes=max(new_classes) + 1))
+            if bg_classes:
+                vals_bg.append(compute_basic_miou(pred=pred, target=targets, num_classes=max(bg_classes) + 1))
+
+    def _mean(xs: List[float]) -> float:
+        return float(sum(xs) / len(xs)) if xs else 0.0
+
+    return {
+        "mIoU_all": _mean(vals_all),
+        "mIoU_old": _mean(vals_old),
+        "mIoU_new": _mean(vals_new),
+        "BG-mIoU": _mean(vals_bg),
+    }
+
+
+def _save_mock_inference_preview(
+    task_dir: Path,
+    model: nn.Module,
+    task: TaskDef,
+    num_classes: int,
+    seed: int,
+) -> Optional[Path]:
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except Exception:
+        return None
+
+    core_model = getattr(model, "core_model", model)
+    text_embeddings = getattr(model, "text_embeddings", None)
+    if text_embeddings is None:
+        return None
+
+    batch = _sample_mock_eval_batch(task=task, num_classes=num_classes, batch_size=1, image_size=64, seed=seed)
+    device = next(core_model.parameters()).device
+    images = batch["images"].to(device)
+    targets = batch["targets"]
+    with torch.no_grad():
+        logits = core_model(images=images, text_embeddings=text_embeddings, targets=None)["logits"]
+    pred = logits.argmax(dim=1).detach().cpu()
+
+    image_np = images.detach().cpu()[0].permute(1, 2, 0)
+    image_np = ((image_np + 1.0) / 2.0).clamp(0.0, 1.0).numpy()
+    target_np = targets[0].numpy()
+    pred_np = pred[0].numpy()
+
+    task_dir.mkdir(parents=True, exist_ok=True)
+    out_path = task_dir / "mock_inference_preview.png"
+    fig, axes = plt.subplots(1, 3, figsize=(12, 4))
+    axes[0].imshow(image_np)
+    axes[0].set_title("Input")
+    axes[1].imshow(target_np, cmap="tab20")
+    axes[1].set_title("Target")
+    axes[2].imshow(pred_np, cmap="tab20")
+    axes[2].set_title("Prediction")
+    for ax in axes:
+        ax.axis("off")
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=150)
+    plt.close(fig)
+    return out_path
+
+
 def _build_d2_progress_callback(task_id: int, total_tasks: int, task_total_iters: int):
     iter_pattern = re.compile(r"iter:\s*(\d+)")
     last_iter = {"value": -1}
@@ -409,6 +539,60 @@ class _D2TaskProgress:
 
     def train_elapsed_sec(self) -> int:
         return int(max(0.0, time.monotonic() - self._train_started_at))
+
+
+class _MockTaskProgress:
+    def __init__(self, task_id: int, total_tasks: int, n_pre: int, n_main: int):
+        self.task_id = task_id
+        self.total_tasks = total_tasks
+        self._started_at = time.monotonic()
+        self._totals = {
+            "phase1": max(1, int(n_pre)),
+            "phase2": max(1, int(n_main)),
+            "phase3": 1,
+            "phase4": 1,
+            "infer": 1,
+        }
+        self._bars: Dict[str, object] = {}
+        self._order = ["phase1", "phase2", "phase3", "phase4", "infer"]
+
+    def callback(self, event: Dict[str, object]) -> None:
+        phase = str(event.get("phase", "")).strip().lower()
+        if phase not in self._totals:
+            return
+        total = max(1, int(event.get("total", self._totals[phase])))
+        current = min(max(int(event.get("current", 0)), 0), total)
+        pbar = self._bars.get(phase)
+        if pbar is None or pbar.total != total:
+            if pbar is not None:
+                pbar.close()
+            pbar = tqdm(
+                total=total,
+                desc=f"task {self.task_id}/{self.total_tasks} {phase}",
+                dynamic_ncols=True,
+                leave=True,
+            )
+            self._bars[phase] = pbar
+        pbar.n = current
+        pbar.refresh()
+        message = event.get("message")
+        if isinstance(message, str) and message:
+            tqdm.write(
+                "[open-continual] "
+                f"task {self.task_id}/{self.total_tasks} {phase} | {message}"
+            )
+
+    def close(self) -> None:
+        for phase in self._order:
+            pbar = self._bars.get(phase)
+            if pbar is None:
+                continue
+            pbar.n = pbar.total
+            pbar.refresh()
+            pbar.close()
+
+    def elapsed_sec(self) -> int:
+        return int(max(0.0, time.monotonic() - self._started_at))
 
 
 @dataclass
@@ -731,15 +915,42 @@ class OpenContinualTrainer:
                     "balanced_rho_old": float(balanced_state.rho_old),
                 }
             phase_cfg = {**task_cfg, **method_phase_cfg, **balanced_knobs, "n_main": task_main_iters}
+            mock_progress = _MockTaskProgress(
+                task_id=task.task_id,
+                total_tasks=total_tasks,
+                n_pre=int(phase_cfg.get("n_pre", self.n_pre)),
+                n_main=int(task_main_iters),
+            ) if self.engine == "mock" else None
             batch = _build_phase_batch(task)
             if self.engine == "mock":
                 assert self._mock_model is not None
-                self._mock_model, phase_metrics = run_mock_task_training(
-                    model=self._mock_model,
-                    task=task,
-                    cfg=phase_cfg,
-                    basis_history=[torch.tensor(b, dtype=torch.float32) for b in basis_history],
-                )
+                try:
+                    try:
+                        self._mock_model, phase_metrics = run_mock_task_training(
+                            model=self._mock_model,
+                            task=task,
+                            cfg=phase_cfg,
+                            basis_history=[torch.tensor(b, dtype=torch.float32) for b in basis_history],
+                            progress_callback=mock_progress.callback if mock_progress is not None else None,
+                        )
+                    except TypeError as exc:
+                        if "progress_callback" not in str(exc):
+                            raise
+                        self._mock_model, phase_metrics = run_mock_task_training(
+                            model=self._mock_model,
+                            task=task,
+                            cfg=phase_cfg,
+                            basis_history=[torch.tensor(b, dtype=torch.float32) for b in basis_history],
+                        )
+                    if mock_progress is not None:
+                        print(
+                            "[open-continual] "
+                            f"task {task.task_id}/{total_tasks} mock train done | "
+                            f"elapsed_sec={mock_progress.elapsed_sec()}"
+                        )
+                finally:
+                    if mock_progress is not None:
+                        mock_progress.close()
                 p1 = dict(phase_metrics["phase1"])
                 p2 = dict(phase_metrics["phase2"])
                 p3 = dict(phase_metrics["phase3"])
@@ -1006,6 +1217,52 @@ class OpenContinualTrainer:
                     mock_record["proxy_source"] = "mock_training_loop"
                     mock_record["engine"] = "mock"
                     append_metrics_jsonl(self._metrics_path(), mock_record)
+                if self._mock_model is not None:
+                    all_task_classes = [
+                        int(c)
+                        for t in plan.tasks
+                        for c in (t.seen_classes + t.new_classes + t.background_classes)
+                    ]
+                    num_classes = max(all_task_classes, default=-1) + 1
+                    mock_eval_payload = _compute_mock_task_eval_metrics(
+                        model=self._mock_model,
+                        task=task,
+                        num_classes=max(1, num_classes),
+                        seed=self.seed + task.task_id * 100,
+                    )
+                    append_metrics_jsonl(
+                        self._metrics_path(),
+                        {
+                            "task": float(task.task_id),
+                            "phase": "eval",
+                            "mIoU_all": _safe_float(mock_eval_payload.get("mIoU_all")),
+                            "mIoU_old": _safe_float(mock_eval_payload.get("mIoU_old")),
+                            "mIoU_new": _safe_float(mock_eval_payload.get("mIoU_new")),
+                            "BG-mIoU": _safe_float(mock_eval_payload.get("BG-mIoU")),
+                            "engine": "mock",
+                        },
+                    )
+                    print(
+                        "[open-continual] "
+                        f"task {task.task_id}/{total_tasks} eval result | "
+                        f"mIoU_all={_format_metric(mock_eval_payload.get('mIoU_all'))} | "
+                        f"mIoU_old={_format_metric(mock_eval_payload.get('mIoU_old'))} | "
+                        f"mIoU_new={_format_metric(mock_eval_payload.get('mIoU_new'))} | "
+                        f"BG-mIoU={_format_metric(mock_eval_payload.get('BG-mIoU'))}"
+                    )
+                    preview_path = _save_mock_inference_preview(
+                        task_dir=task_dir,
+                        model=self._mock_model,
+                        task=task,
+                        num_classes=max(1, num_classes),
+                        seed=self.seed + task.task_id * 200,
+                    )
+                    if preview_path is not None:
+                        print(
+                            "[open-continual] "
+                            f"task {task.task_id}/{total_tasks} inference preview | "
+                            f"path={preview_path}"
+                        )
 
             if balanced_enabled:
                 current_eval = {

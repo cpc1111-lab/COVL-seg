@@ -256,6 +256,10 @@ def _run_d2_command(
     env = os.environ.copy()
     env.setdefault("DETECTRON2_DATASETS", str(_workspace_root() / "datasets"))
     env.setdefault("PYTORCH_CUDA_ALLOC_CONF", "max_split_size_mb:128")
+    workspace = str(_workspace_root())
+    pythonpath_entries = [entry for entry in env.get("PYTHONPATH", "").split(os.pathsep) if entry]
+    if workspace not in pythonpath_entries:
+        env["PYTHONPATH"] = os.pathsep.join([workspace] + pythonpath_entries)
     if env_overrides:
         env.update(env_overrides)
 

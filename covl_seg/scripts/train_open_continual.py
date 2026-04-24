@@ -36,7 +36,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     parser.add_argument("--col-method", choices=["covl", "none", "replay", "ewc"], default="covl")
     parser.add_argument("--task-spec", default=None)
-    parser.add_argument("--num-tasks", type=int, default=None)
+    parser.add_argument("--num-tasks", type=int, default=10)
     parser.add_argument("--classes-per-task", type=int, default=None)
     parser.add_argument("--task-seed", type=int, default=0)
 
@@ -67,7 +67,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     parser.add_argument("--n-pre", type=int, default=200)
-    parser.add_argument("--n-main", type=int, default=4000)
+    parser.add_argument("--n-main", type=int, default=10000)
     parser.add_argument(
         "--train-iters-mode",
         choices=["off", "on", "auto"],

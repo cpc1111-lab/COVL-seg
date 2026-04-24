@@ -111,3 +111,36 @@ def test_run_mock_task_training_cuda_completes_when_available():
     _, phase_metrics = run_mock_task_training(model=model, task=task, cfg=cfg, basis_history=[])
 
     assert set(phase_metrics.keys()) == {"phase1", "phase2", "phase3", "phase4"}
+
+
+def test_run_mock_task_training_emits_progress_events():
+    model = build_covl_training_model(num_classes=8, text_dim=16, seed=13)
+    task = TaskDef(task_id=5, new_classes=[0, 1], seen_classes=[0, 1, 2], background_classes=[3, 4, 5, 6, 7])
+    cfg = {
+        "n_pre": 2,
+        "n_main": 3,
+        "enable_ciba": True,
+        "enable_ctr": True,
+        "enable_spectral_ogp": True,
+        "batch_size": 2,
+        "image_size": 16,
+        "seed": 13,
+    }
+
+    events = []
+
+    def _on_progress(event):
+        events.append(dict(event))
+
+    run_mock_task_training(
+        model=model,
+        task=task,
+        cfg=cfg,
+        basis_history=[],
+        progress_callback=_on_progress,
+    )
+
+    phases = {e.get("phase") for e in events}
+    assert {"phase1", "phase2", "phase3", "phase4", "infer"}.issubset(phases)
+    assert any(e.get("phase") == "phase1" and e.get("current") == 2 and e.get("total") == 2 for e in events)
+    assert any(e.get("phase") == "phase2" and e.get("current") == 3 and e.get("total") == 3 for e in events)

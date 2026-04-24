@@ -69,9 +69,16 @@ def test_trainer_writes_plan_state_and_metrics(tmp_path, capsys):
     assert "omega_tau_t" in third
     assert "alpha_star" in third
     assert first["engine"] == "mock"
+    eval_records = [json.loads(line) for line in metric_lines if json.loads(line).get("phase") == "eval"]
+    assert eval_records
+    latest_eval = eval_records[-1]
+    assert "mIoU_all" in latest_eval
+    assert "mIoU_old" in latest_eval
+    assert "mIoU_new" in latest_eval
     checkpoint = json.loads((tmp_path / "run" / "checkpoint_task_002.json").read_text(encoding="utf-8"))
     mock_model_path = checkpoint["mock_model_path"]
     assert Path(mock_model_path).exists()
+    assert (tmp_path / "run" / "task_001" / "mock_inference_preview.png").exists()
 
 
 def test_trainer_mock_resume_restores_saved_model_state(tmp_path, monkeypatch):
@@ -252,6 +259,76 @@ EXPERIMENT:
     )
 
     trainer.run()
+
+
+def test_trainer_mock_passes_progress_callback_to_training_loop(tmp_path, monkeypatch):
+    cfg = _write_mock_config(tmp_path)
+    out_dir = tmp_path / "run_mock_progress"
+    seen = {"called": False}
+
+    def _fake_run_mock_task_training(*, model, task, cfg, basis_history, progress_callback=None):
+        del cfg, basis_history
+        assert progress_callback is not None
+        progress_callback({"phase": "phase1", "current": 1, "total": 1})
+        progress_callback({"phase": "phase2", "current": 1, "total": 1})
+        progress_callback({"phase": "phase3", "current": 1, "total": 1})
+        progress_callback({"phase": "phase4", "current": 1, "total": 1})
+        progress_callback({"phase": "infer", "current": 1, "total": 1})
+        seen["called"] = True
+        return model, {
+            "phase1": {"phase": "phase1", "task": float(task.task_id), "loss": 1.0, "beta_1_star": 0.1, "beta_2_star": 0.1},
+            "phase2": {
+                "phase": "phase2",
+                "task": float(task.task_id),
+                "loss": 1.0,
+                "ctr_loss": 0.1,
+                "oldfix_weighted_term": 0.0,
+            },
+            "phase3": {
+                "phase": "phase3",
+                "task": float(task.task_id),
+                "loss": 1.0,
+                "alpha_star": 0.5,
+                "tau_pred": 0.5,
+                "subspace_basis": [0.1, 0.2],
+            },
+            "phase4": {"phase": "phase4", "task": float(task.task_id), "loss": 1.0},
+        }
+
+    monkeypatch.setattr(
+        "covl_seg.engine.open_continual_trainer.run_mock_task_training",
+        _fake_run_mock_task_training,
+    )
+
+    trainer = OpenContinualTrainer(
+        config_path=str(cfg),
+        output_dir=out_dir,
+        engine="mock",
+        seed=0,
+        method_name="covl",
+        clip_finetune="attention",
+        task_spec=None,
+        num_tasks=1,
+        classes_per_task=2,
+        task_seed=0,
+        n_pre=1,
+        n_main=1,
+        eps_f=0.05,
+        t_mem="all",
+        mix_ratio=[3, 1],
+        m_max_total=100,
+        m_max_per_class=10,
+        ewc_lambda=10.0,
+        ewc_topk=4,
+        ewc_iters=10,
+        enable_ciba=True,
+        enable_ctr=True,
+        enable_spectral_ogp=True,
+        enable_sacr=True,
+    )
+
+    trainer.run(max_tasks=1)
+    assert seen["called"] is True
 
 
 def test_trainer_resume_rejects_method_mismatch(tmp_path):

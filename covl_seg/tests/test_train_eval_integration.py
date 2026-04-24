@@ -103,3 +103,40 @@ def test_train_once_d2_auto_bootstraps_missing_datasets(monkeypatch, tmp_path: P
     assert payload["last_task"] == 1
     assert len(bootstrap_calls) == 1
     assert str(bootstrap_calls[0][0]).endswith("datasets")
+
+
+def test_train_once_d2_passes_streaming_progress_callback(monkeypatch, tmp_path: Path, capsys):
+    from covl_seg.scripts import train_continual as train
+
+    captured_kwargs = {}
+
+    def _fake_bootstrap(*, datasets_root, runtime_root, force_download=False):
+        del datasets_root, runtime_root, force_download
+
+    def _fake_run_detectron2_train(**kwargs):
+        captured_kwargs.update(kwargs)
+        callback = kwargs.get("progress_callback")
+        assert callback is not None
+        callback("[iter 1] loss=1.23")
+        return {"num_tasks": 1, "num_phase_records": 1, "last_task": 1}
+
+    monkeypatch.setattr(train, "detectron2_available", lambda: True)
+    monkeypatch.setattr(train, "ensure_coco_stuff_ready_for_training", _fake_bootstrap)
+    monkeypatch.setattr(train, "run_detectron2_train", _fake_run_detectron2_train)
+
+    out_dir = tmp_path / "d2_logs"
+    payload = train.run_train_once(
+        config_path="covl_seg/configs/covl_seg_vitb_ade15.yaml",
+        output_dir=out_dir,
+        seed=0,
+        resume_task=0,
+        max_tasks=1,
+        engine="d2",
+        seg_net="vitb",
+        datasets_root=str(tmp_path / "datasets"),
+    )
+
+    assert payload["last_task"] == 1
+    assert "progress_callback" in captured_kwargs
+    output = capsys.readouterr().out
+    assert "[iter 1] loss=1.23" in output

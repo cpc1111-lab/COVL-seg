@@ -14,6 +14,10 @@ from covl_seg.scripts.bootstrap_coco_train import (
 )
 
 
+def _emit_d2_progress(line: str) -> None:
+    print(line, flush=True)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Train COVL-Seg continual model")
     parser.add_argument("--config", required=True, help="Path to YAML config")
@@ -111,6 +115,7 @@ def run_train_once(
             resume_task=resume_task,
             max_tasks=max_tasks,
             seg_network=seg_net,
+            progress_callback=_emit_d2_progress,
         )
 
     return train_mock_continual(
