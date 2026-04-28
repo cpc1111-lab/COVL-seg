@@ -115,6 +115,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--enable-sacr", dest="enable_sacr", action="store_true")
     parser.add_argument("--disable-sacr", dest="enable_sacr", action="store_false")
     parser.set_defaults(enable_sacr=True)
+
+    parser.add_argument("--use-real-training", dest="use_real_training", action="store_true")
+    parser.set_defaults(use_real_training=False)
+    parser.add_argument("--clip-model-name", dest="clip_model_name", default="ViT-B-16")
+    parser.add_argument("--dino-model-name", dest="dino_model_name", default="dinov2_vitb14")
+    parser.add_argument("--learning-rate", type=float, default=1e-4)
+    parser.add_argument("--text-learning-rate", type=float, default=1e-5)
+    parser.add_argument("--batch-size", type=int, default=4)
+    parser.add_argument("--dataset-root", dest="dataset_root", default="datasets/ADE20K")
     return parser
 
 

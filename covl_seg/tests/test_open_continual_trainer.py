@@ -1665,3 +1665,130 @@ def test_trainer_balanced_controller_does_not_drift_without_eval_signals(tmp_pat
     assert controller["w_ctr"] == 0.0
     assert controller["ov_guard_triggered"] is False
     assert controller["ov_guard_state"] is False
+
+
+def test_trainer_real_training_mode(tmp_path, monkeypatch):
+    cfg = _write_mock_config(tmp_path)
+
+    class FakeModel(torch.nn.Module):
+        def __init__(self, num_classes):
+            super().__init__()
+            self.num_classes = num_classes
+            self.hciba_head = torch.nn.Linear(1, 1)
+            self.fusion_head = torch.nn.Linear(1, 1)
+            self.clip_logit_proj = torch.nn.Linear(1, 1)
+            self.clip_text = torch.nn.Linear(1, 1)
+            self._called_train = False
+            self._called_eval = False
+            self._alpha_set = False
+
+        def train(self, mode=True):
+            self._called_train = True
+            return super().train(mode)
+
+        def eval(self):
+            self._called_eval = True
+            return super().eval()
+
+        def state_dict(self, *args, **kwargs):
+            return {"hciba_head.weight": torch.tensor([[1.0]])}
+
+        def load_state_dict(self, state_dict, strict=True):
+            pass
+
+        def inject_alpha_tau(self, alpha, tau):
+            self._alpha_set = True
+
+        def forward(self, images, class_names, targets=None):
+            return {"logits": torch.zeros(1, 2, 4, 4), "loss": torch.tensor(1.0, requires_grad=True)}
+
+    fake_model = FakeModel(num_classes=2)
+
+    class FakeDataset:
+        def __init__(self, root, split, class_names):
+            self.class_names = class_names
+
+        def __len__(self):
+            return 2
+
+        def __getitem__(self, idx):
+            return {
+                "image": torch.randn(3, 4, 4),
+                "sem_seg": torch.zeros(4, 4, dtype=torch.long),
+                "class_names": self.class_names,
+            }
+
+    class FakeDataLoader:
+        def __init__(self, dataset, batch_size, shuffle, num_workers):
+            self.dataset = dataset
+
+        def __iter__(self):
+            for _ in range(2):
+                yield {
+                    "image": torch.randn(1, 3, 4, 4),
+                    "sem_seg": torch.zeros(1, 4, 4, dtype=torch.long),
+                    "class_names": [f"class_{i}" for i in range(2)],
+                }
+
+        def __len__(self):
+            return 2
+
+    monkeypatch.setattr(
+        "covl_seg.engine.open_continual_trainer.COVLSegModelV2",
+        lambda **kwargs: fake_model,
+    )
+    monkeypatch.setattr(
+        "covl_seg.engine.open_continual_trainer.ADE20KDataset",
+        FakeDataset,
+    )
+    monkeypatch.setattr(
+        "covl_seg.engine.open_continual_trainer.DataLoader",
+        FakeDataLoader,
+    )
+
+    trainer = OpenContinualTrainer(
+        config_path=str(cfg),
+        output_dir=tmp_path / "run_real_training",
+        engine="mock",
+        seed=0,
+        method_name="covl",
+        clip_finetune="attention",
+        task_spec=None,
+        num_tasks=1,
+        classes_per_task=2,
+        task_seed=0,
+        n_pre=1,
+        n_main=2,
+        eps_f=0.05,
+        t_mem="all",
+        mix_ratio=[3, 1],
+        m_max_total=100,
+        m_max_per_class=10,
+        ewc_lambda=0.0,
+        ewc_topk=4,
+        ewc_iters=10,
+        enable_ciba=True,
+        enable_ctr=True,
+        enable_spectral_ogp=True,
+        enable_sacr=True,
+        use_real_training=True,
+    )
+
+    trainer.run(max_tasks=1)
+
+    metrics_text = (tmp_path / "run_real_training" / "metrics.jsonl").read_text(encoding="utf-8")
+    metrics = [json.loads(line) for line in metrics_text.strip().splitlines()]
+    train_records = [m for m in metrics if m.get("phase") == "train"]
+    eval_records = [m for m in metrics if m.get("phase") == "eval"]
+    assert len(train_records) >= 1
+    assert "train_loss" in train_records[0]
+    assert "n_batches" in train_records[0]
+    assert len(eval_records) >= 1
+    assert "accuracy" in eval_records[0]
+    assert "total_pixels" in eval_records[0]
+
+    checkpoint_path = tmp_path / "run_real_training" / "task_001" / "model.pt"
+    assert checkpoint_path.exists(), "model checkpoint should be saved"
+    ckpt = torch.load(str(checkpoint_path), map_location="cpu", weights_only=False)
+    assert "model_state_dict" in ckpt
+    assert "alpha_star" in ckpt

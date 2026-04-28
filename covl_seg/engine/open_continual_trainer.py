@@ -11,6 +11,7 @@ from typing import Callable, Dict, List, Optional
 
 import torch
 from torch import nn
+from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
 _log = logging.getLogger(__name__)
@@ -41,6 +42,9 @@ from covl_seg.engine.phase_runner import (
     run_phase3_subspace_and_fusion,
     run_phase4_replay_update,
 )
+from covl_seg.model.covl_seg_model_new import COVLSegModelV2
+from covl_seg.data.datasets import ADE20KDataset
+from covl_seg.continual.ewc import EWCRegularizer
 
 
 def _infer_num_classes_from_config(config_path: str, *, strict: bool) -> int:
@@ -656,6 +660,13 @@ class OpenContinualTrainer:
     lambda_old_clip: float = 0.1
     lambda_unseen_clip: float = 0.2
     resume_task: int = 0
+    use_real_training: bool = False
+    clip_model_name: str = "ViT-B-16"
+    dino_model_name: str = "dinov2_vitb14"
+    learning_rate: float = 1e-4
+    text_learning_rate: float = 1e-5
+    batch_size: int = 4
+    dataset_root: str = "datasets/ADE20K"
     _mock_model: Optional[nn.Module] = field(default=None, init=False, repr=False)
 
     @classmethod
@@ -702,6 +713,13 @@ class OpenContinualTrainer:
             lambda_old_clip=getattr(args, "lambda_old_clip", 0.1),
             lambda_unseen_clip=getattr(args, "lambda_unseen_clip", 0.2),
             resume_task=args.resume_task,
+            use_real_training=getattr(args, "use_real_training", False),
+            clip_model_name=getattr(args, "clip_model_name", "ViT-B-16"),
+            dino_model_name=getattr(args, "dino_model_name", "dinov2_vitb14"),
+            learning_rate=getattr(args, "learning_rate", 1e-4),
+            text_learning_rate=getattr(args, "text_learning_rate", 1e-5),
+            batch_size=getattr(args, "batch_size", 4),
+            dataset_root=getattr(args, "dataset_root", "datasets/ADE20K"),
         )
 
     def _resolve_task_main_iters(self, task: TaskDef) -> int:
@@ -720,6 +738,72 @@ class OpenContinualTrainer:
         target_iters = max(base_iters, int(self.min_iters_per_visible_class) * visible_count)
         cap_iters = max(base_iters, int(round(base_iters * float(self.max_iters_multiplier))))
         return int(max(base_iters, min(target_iters, cap_iters)))
+
+    def _build_model(self, num_classes: int) -> COVLSegModelV2:
+        model = COVLSegModelV2(
+            clip_model_name=self.clip_model_name,
+            dino_model_name=self.dino_model_name,
+            clip_finetune=self.clip_finetune,
+            num_classes=num_classes,
+        )
+        return model
+
+    def _build_dataloader(self, task: TaskDef) -> DataLoader:
+        class_names = [f"class_{c}" for c in task.seen_classes]
+        dataset = ADE20KDataset(
+            root=self.dataset_root,
+            split="training",
+            class_names=class_names,
+        )
+        return DataLoader(dataset, batch_size=self.batch_size, shuffle=True, num_workers=0)
+
+    def _train_task(self, model: COVLSegModelV2, dataloader: DataLoader, ewc: Optional[EWCRegularizer] = None) -> Dict[str, float]:
+        model.train()
+        optimizer = torch.optim.AdamW([
+            {"params": model.hciba_head.parameters()},
+            {"params": model.fusion_head.parameters()},
+            {"params": model.clip_logit_proj.parameters()},
+            {"params": model.clip_text.parameters(), "lr": self.text_learning_rate},
+        ], lr=self.learning_rate)
+
+        total_loss = 0.0
+        n_batches = 0
+        for batch in dataloader:
+            images = batch["image"]
+            targets = batch["sem_seg"]
+            class_names = batch["class_names"][0]
+
+            optimizer.zero_grad()
+            outputs = model(images, class_names, targets=targets)
+            loss = outputs["loss"]
+
+            if ewc is not None:
+                loss = loss + ewc.penalty(model)
+
+            loss.backward()
+            optimizer.step()
+            total_loss += loss.item()
+            n_batches += 1
+            if n_batches >= self.n_main:
+                break
+
+        return {"train_loss": total_loss / max(n_batches, 1), "n_batches": float(n_batches)}
+
+    def _eval_task(self, model: COVLSegModelV2, dataloader: DataLoader, class_names: List[str]) -> Dict[str, float]:
+        model.eval()
+        correct = 0
+        total = 0
+        with torch.no_grad():
+            for batch in dataloader:
+                images = batch["image"]
+                targets = batch["sem_seg"]
+                outputs = model(images, class_names)
+                preds = outputs["logits"].argmax(dim=1)
+                mask = targets != 255
+                correct += (preds[mask] == targets[mask]).sum().item()
+                total += mask.sum().item()
+        accuracy = correct / max(total, 1)
+        return {"accuracy": accuracy, "total_pixels": float(total)}
 
     def _build_task_plan(self) -> TaskPlan:
         total_classes = _infer_num_classes_from_config(
@@ -933,6 +1017,21 @@ class OpenContinualTrainer:
                     "balanced_rho_old": float(balanced_state.rho_old),
                 }
             phase_cfg = {**task_cfg, **method_phase_cfg, **balanced_knobs, "n_main": task_main_iters}
+            model = None
+            ewc = None
+            dataloader = None
+            if self.use_real_training:
+                model = self._build_model(num_classes=len(task.seen_classes))
+                if task.task_id > 1 and (self.output_dir / f"task_{task.task_id - 1:03d}" / "model.pt").exists():
+                    ckpt = torch.load(self.output_dir / f"task_{task.task_id - 1:03d}" / "model.pt", map_location="cpu")
+                    model.load_state_dict(ckpt["model_state_dict"], strict=False)
+                    if "alpha_star" in ckpt:
+                        model.inject_alpha_tau(ckpt["alpha_star"], ckpt.get("tau_pred", 1.0))
+                dataloader = self._build_dataloader(task)
+                train_metrics = self._train_task(model, dataloader, ewc=ewc)
+                append_metrics_jsonl(self._metrics_path(), {"phase": "train", "task": float(task.task_id), **train_metrics})
+                eval_metrics = self._eval_task(model, dataloader, [f"class_{c}" for c in task.seen_classes])
+                append_metrics_jsonl(self._metrics_path(), {"phase": "eval", "task": float(task.task_id), **eval_metrics})
             mock_progress = _MockTaskProgress(
                 task_id=task.task_id,
                 total_tasks=total_tasks,
@@ -988,6 +1087,32 @@ class OpenContinualTrainer:
                 "tau_pred": _safe_float(p3.get("tau_pred")),
                 "omega_tau_t": _safe_float(p3.get("omega_tau_t")),
             }
+
+            if self.use_real_training and model is not None:
+                alpha_star = _safe_float_or(real_continual.get("alpha_star"), float(p3["alpha_star"]))
+                tau_pred = _safe_float_or(real_continual.get("tau_pred"), float(p3["tau_pred"]))
+                model.inject_alpha_tau(alpha_star, tau_pred)
+
+                if self.ewc_lambda > 0:
+                    ewc = EWCRegularizer(model, lambda_ewc=self.ewc_lambda)
+                    _sample_batch = next(iter(dataloader))
+                    ewc.compute_fisher(
+                        dataloader,
+                        loss_fn=lambda inputs, targets: model(
+                            inputs,
+                            _sample_batch["class_names"][0] if isinstance(_sample_batch, dict) and "class_names" in _sample_batch else [f"class_{i}" for i in range(model.num_classes)],
+                            targets=targets,
+                        )["loss"],
+                        n_samples=self.ewc_iters,
+                    )
+                    ewc.consolidate()
+
+                task_dir.mkdir(parents=True, exist_ok=True)
+                torch.save({
+                    "model_state_dict": model.state_dict(),
+                    "alpha_star": alpha_star,
+                    "tau_pred": tau_pred,
+                }, task_dir / "model.pt")
 
             eval_payload = None
             if self.engine == "d2":
