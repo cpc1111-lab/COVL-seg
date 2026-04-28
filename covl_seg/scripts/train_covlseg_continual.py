@@ -1,0 +1,90 @@
+import argparse
+import json
+from pathlib import Path
+
+import yaml
+
+from covl_seg.engine.open_continual_trainer import OpenContinualTrainer
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Train COVL-Seg continual open-vocabulary segmentation model")
+    parser.add_argument("--config", required=True, help="Path to YAML config file")
+    parser.add_argument("--output-dir", required=True)
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--resume-task", type=int, default=0)
+    parser.add_argument("--max-tasks", type=int, default=None)
+
+    parser.add_argument("--col-method", choices=["covl", "none", "replay", "ewc"], default="covl")
+    parser.add_argument("--task-spec", default=None)
+    parser.add_argument("--num-tasks", type=int, default=10)
+    parser.add_argument("--classes-per-task", type=int, default=None)
+    parser.add_argument("--task-seed", type=int, default=0)
+
+    parser.add_argument("--clip-finetune", choices=["none", "attention", "v_only", "full"], default="attention")
+    parser.add_argument("--clip-model-name", default="ViT-B-16")
+    parser.add_argument("--dino-model-name", default="dinov2_vitb14")
+
+    parser.add_argument("--n-pre", type=int, default=200)
+    parser.add_argument("--n-main", type=int, default=10000)
+    parser.add_argument("--eps-f", type=float, default=0.05)
+    parser.add_argument("--t-mem", default="all")
+    parser.add_argument("--mix-ratio", nargs=2, type=int, default=[3, 1])
+    parser.add_argument("--m-max-total", type=int, default=4000)
+    parser.add_argument("--m-max-per-class", type=int, default=200)
+    parser.add_argument("--ewc-lambda", type=float, default=10.0)
+    parser.add_argument("--ewc-topk", type=int, default=8)
+    parser.add_argument("--ewc-iters", type=int, default=25)
+
+    parser.add_argument("--learning-rate", type=float, default=1e-4)
+    parser.add_argument("--text-learning-rate", type=float, default=1e-5)
+    parser.add_argument("--batch-size", type=int, default=4)
+    parser.add_argument("--dataset-root", default="datasets/ADE20K")
+
+    parser.add_argument("--balanced-profile", choices=["off", "balanced"], default="off")
+    parser.add_argument("--target-delta-new", type=float, default=0.30)
+    parser.add_argument("--epsilon-old", type=float, default=0.20)
+    parser.add_argument("--epsilon-all", type=float, default=0.15)
+    parser.add_argument("--epsilon-ov", type=float, default=0.20)
+
+    parser.add_argument("--enable-ciba", dest="enable_ciba", action="store_true")
+    parser.add_argument("--disable-ciba", dest="enable_ciba", action="store_false")
+    parser.set_defaults(enable_ciba=True)
+    parser.add_argument("--enable-ctr", dest="enable_ctr", action="store_true")
+    parser.add_argument("--disable-ctr", dest="enable_ctr", action="store_false")
+    parser.set_defaults(enable_ctr=False)
+    parser.add_argument("--enable-spectral-ogp", dest="enable_spectral_ogp", action="store_true")
+    parser.add_argument("--disable-spectral-ogp", dest="enable_spectral_ogp", action="store_false")
+    parser.set_defaults(enable_spectral_ogp=True)
+    parser.add_argument("--enable-sacr", dest="enable_sacr", action="store_true")
+    parser.add_argument("--disable-sacr", dest="enable_sacr", action="store_false")
+    parser.set_defaults(enable_sacr=True)
+
+    parser.add_argument("--use-real-training", dest="use_real_training", action="store_true")
+    parser.set_defaults(use_real_training=False)
+    return parser
+
+
+def main() -> None:
+    args = build_parser().parse_args()
+    out_dir = Path(args.output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    with open(args.config, "r") as f:
+        cfg = yaml.safe_load(f)
+
+    run_cfg = vars(args).copy()
+    run_cfg.update(cfg)
+    (out_dir / "run_config.json").write_text(json.dumps(run_cfg, indent=2), encoding="utf-8")
+
+    trainer = OpenContinualTrainer.from_args(args)
+    result = trainer.run(max_tasks=args.max_tasks)
+    print(
+        "COVL-Seg continual run complete: "
+        f"tasks_executed={int(result['tasks_executed'])}, "
+        f"last_task={int(result['last_task'])}"
+    )
+
+
+if __name__ == "__main__":
+    main()
