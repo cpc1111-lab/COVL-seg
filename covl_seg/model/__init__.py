@@ -6,6 +6,7 @@ from .covl_seg_model import COVLSegModel
 from .dino_extractor import DINOv2FeatureExtractor
 from .fusion import FusionHead
 from .hciba_head import HCIBAHead
+from .hciba_multi_scale_head import HCIBAMultiScaleHead
 
 __all__ = [
     "BoundaryDetector",
@@ -14,4 +15,5 @@ __all__ = [
     "DINOv2FeatureExtractor",
     "FusionHead",
     "HCIBAHead",
+    "HCIBAMultiScaleHead",
 ]
