@@ -1,0 +1,39 @@
+model:
+  clip_model_name: "ViT-B-16"
+  dino_model_name: "dinov2_vitb14"
+  clip_finetune: "attention"
+  num_classes: 164
+  out_dim: 768
+
+dataset:
+  name: "coco_stuff"
+  root: "datasets/COCO-Stuff"
+  split: "training"
+
+training:
+  batch_size: 4
+  num_workers: 4
+  learning_rate: 0.0001
+  text_learning_rate: 0.00001
+  weight_decay: 0.01
+  n_main: 10000
+  use_real_training: true
+
+continual:
+  method: "covl"
+  num_tasks: 10
+  classes_per_task: 16
+  task_seed: 0
+  ewc_lambda: 10.0
+  ewc_topk: 8
+  ewc_iters: 25
+  balanced_profile: "off"
+  eps_f: 0.05
+  t_mem: "all"
+  mix_ratio: [3, 1]
+  m_max_total: 4000
+  m_max_per_class: 200
+  enable_ciba: true
+  enable_ctr: true
+  enable_spectral_ogp: true
+  enable_sacr: true
