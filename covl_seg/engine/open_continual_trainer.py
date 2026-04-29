@@ -43,7 +43,7 @@ from covl_seg.engine.phase_runner import (
     run_phase4_replay_update,
 )
 from covl_seg.model.covl_seg_model_new import COVLSegModelV2
-from covl_seg.data.datasets import ADE20KDataset
+from covl_seg.data.datasets import ADE20KDataset, COCOStuffDataset
 from covl_seg.continual.ewc import EWCRegularizer
 
 
@@ -750,11 +750,20 @@ class OpenContinualTrainer:
 
     def _build_dataloader(self, task: TaskDef) -> DataLoader:
         class_names = [f"class_{c}" for c in task.seen_classes]
-        dataset = ADE20KDataset(
-            root=self.dataset_root,
-            split="training",
-            class_names=class_names,
-        )
+        config_lower = self.config_path.lower()
+        if "coco" in config_lower:
+            dataset = COCOStuffDataset(
+                root=self.dataset_root,
+                split="training",
+                class_names=class_names,
+                num_classes=max(task.seen_classes) + 1 if task.seen_classes else 164,
+            )
+        else:
+            dataset = ADE20KDataset(
+                root=self.dataset_root,
+                split="training",
+                class_names=class_names,
+            )
         return DataLoader(dataset, batch_size=self.batch_size, shuffle=True, num_workers=0)
 
     def _train_task(self, model: COVLSegModelV2, dataloader: DataLoader, ewc: Optional[EWCRegularizer] = None) -> Dict[str, float]:
