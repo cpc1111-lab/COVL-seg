@@ -7,6 +7,7 @@ from torch import nn
 
 from covl_seg.continual.task_partition import TaskDef
 from covl_seg.continual.spectral_ogp import hard_project_gradient
+from covl_seg.continual.replay_buffer import SACRReplayBuffer
 from covl_seg.engine.phase_runner import run_phase4_replay_update
 from covl_seg.losses.ciba import ciba_alignment_loss, estimate_beta_star
 from covl_seg.losses.mine import ConditionalMINECritic, conditional_mine_loss, conditional_mine_lower_bound
@@ -109,7 +110,7 @@ def _assign_flat_grads(model: nn.Module, flat_grad: torch.Tensor) -> None:
         cursor += width
 
 
-def _quick_conditional_mi(x: torch.Tensor, y: torch.Tensor, cond: torch.Tensor, steps: int = 5) -> float:
+def _quick_conditional_mi(x: torch.Tensor, y: torch.Tensor, cond: torch.Tensor, steps: int = 20) -> float:
     x = x.detach().reshape(-1, 1).float()
     y = y.detach().reshape(-1, 1).float()
     cond = cond.detach().reshape(-1, 1).float()
@@ -121,7 +122,7 @@ def _quick_conditional_mi(x: torch.Tensor, y: torch.Tensor, cond: torch.Tensor, 
         return 0.0
 
     critic = ConditionalMINECritic(feature_dim=1, hidden_dim=16).to(device=x.device, dtype=x.dtype)
-    opt = torch.optim.Adam(critic.parameters(), lr=5e-3)
+    opt = torch.optim.Adam(critic.parameters(), lr=1e-3)
     for _ in range(steps):
         opt.zero_grad()
         mine_obj = conditional_mine_loss(critic, x, y, cond)
@@ -177,6 +178,7 @@ def run_mock_task_training(
     cfg: Dict[str, object],
     basis_history: Sequence[Sequence[float]],
     progress_callback: Optional[Callable[[Dict[str, object]], None]] = None,
+    replay_buffer: Optional[SACRReplayBuffer] = None,
 ) -> Tuple[nn.Module, Dict[str, Dict[str, object]]]:
     core_model = getattr(model, "core_model", model)
     text_embeddings = getattr(model, "text_embeddings", None)
@@ -197,6 +199,8 @@ def run_mock_task_training(
 
     i_exc_c = 0.0
     i_exc_s = 0.0
+    i_exc_c_acc: List[float] = []
+    i_exc_s_acc: List[float] = []
     phase1_losses: List[float] = []
     phase1_ciba_losses: List[float] = []
     last_phase2_outputs: Dict[str, torch.Tensor] = {}
@@ -221,23 +225,25 @@ def run_mock_task_training(
         seg_loss = outputs["loss"]
 
         projected = outputs["projected"]
-        stream_c = projected.mean(dim=(1, 2, 3))
-        stream_s = outputs["boundary_map"].mean(dim=(1, 2, 3))
-        stream_y = targets.float().mean(dim=(1, 2))
-        i_exc_c = _quick_conditional_mi(stream_c, stream_y, stream_s)
-        i_exc_s = _quick_conditional_mi(stream_s, stream_y, stream_c)
+        stream_c = projected.mean(dim=1).reshape(-1)
+        stream_s = outputs["boundary_map"].mean(dim=1).reshape(-1)
+        stream_y = targets.float().reshape(-1)
+        i_exc_c_step = _quick_conditional_mi(stream_c, stream_y, stream_s)
+        i_exc_s_step = _quick_conditional_mi(stream_s, stream_y, stream_c)
+        i_exc_c_acc.append(i_exc_c_step)
+        i_exc_s_acc.append(i_exc_s_step)
 
         ciba_loss = torch.tensor(0.0, dtype=seg_loss.dtype, device=seg_loss.device)
         if enable_ciba:
             pooled_proj = projected.mean(dim=(2, 3))
             pooled_target = text_embeddings[targets].mean(dim=(1, 2))
-            delta = max(0.0, i_exc_s - i_exc_c)
+            delta = max(0.0, i_exc_s_step - i_exc_c_step)
             sigma_trace = float(stream_s.var().item()) * max(stream_s.numel(), 1)
             beta_1 = estimate_beta_star(delta=delta, sigma_trace=sigma_trace, dim=max(stream_s.numel(), 1))
             ciba_loss = ciba_alignment_loss(
                 pooled_proj,
                 pooled_target,
-                mi_estimate=torch.tensor(i_exc_c, dtype=seg_loss.dtype, device=seg_loss.device),
+                mi_estimate=torch.tensor(i_exc_c_step, dtype=seg_loss.dtype, device=seg_loss.device),
                 beta_star=min(beta_1, 0.05),
             )
             ciba_loss = torch.minimum(ciba_loss, torch.tensor(-1e-6, dtype=seg_loss.dtype, device=seg_loss.device))
@@ -255,6 +261,9 @@ def run_mock_task_training(
             current=step + 1,
             total=n_pre,
         )
+
+    i_exc_c = sum(i_exc_c_acc) / len(i_exc_c_acc) if i_exc_c_acc else 0.0
+    i_exc_s = sum(i_exc_s_acc) / len(i_exc_s_acc) if i_exc_s_acc else 0.0
 
     cfg_with_history = dict(cfg)
     cfg_with_history["_basis_history"] = [list(v) for v in basis_history]
@@ -331,7 +340,8 @@ def run_mock_task_training(
     alpha_star = max(float(i_exc_c / denom), alpha_floor)
     tau_init = float(cfg.get("tau_init", 0.07))
     n_t = max(1, n_main)
-    tau_pred = float(max(1e-4, min(tau_init * (max(i_exc_s, 1e-6) ** (-0.25)), 1.0)))
+    c0 = tau_init * float(n_t) ** 0.25
+    tau_pred = float(max(1e-4, min(c0 * (float(n_t) * max(i_exc_s, 1e-6)) ** (-0.25), 1.0)))
 
     basis_vec = ogp_basis[:, 0] if ogp_basis.numel() else torch.zeros(1)
     fisher_energy = float(torch.clamp(torch.norm(basis_vec) ** 2, min=1e-8).item())
@@ -348,7 +358,7 @@ def run_mock_task_training(
     _emit_progress(progress_callback, phase="phase3", current=1, total=1)
 
     replay_batch = _build_replay_batch(last_phase2_outputs, last_phase2_targets, last_bg_logits)
-    phase4 = run_phase4_replay_update(task.task_id, cfg, batch=replay_batch)
+    phase4 = run_phase4_replay_update(task.task_id, cfg, batch=replay_batch, replay_buffer=replay_buffer)
     _emit_progress(progress_callback, phase="phase4", current=1, total=1)
 
     infer_batch = _make_synthetic_batch(

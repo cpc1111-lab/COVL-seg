@@ -16,6 +16,7 @@ from tqdm.auto import tqdm
 _log = logging.getLogger(__name__)
 
 from covl_seg.continual.methods import build_continual_method
+from covl_seg.continual.replay_buffer import SACRReplayBuffer
 from covl_seg.continual.task_partition import TaskDef, TaskPlan, build_task_plan
 from covl_seg.engine.balanced_controller import (
     BalancedControllerConfig,
@@ -849,6 +850,10 @@ class OpenContinualTrainer:
         }
         clip_overrides = _clip_overrides(self.clip_finetune)
         class_names = _resolve_task_class_names(self.config_path) if self.engine == "d2" else None
+        sacr_replay_buffer = SACRReplayBuffer(
+            max_total_items=self.m_max_total,
+            max_per_class=self.m_max_per_class,
+        )
         if self.engine == "mock" and self._mock_model is None:
             all_task_classes = [
                 c
@@ -932,16 +937,45 @@ class OpenContinualTrainer:
                             cfg=phase_cfg,
                             basis_history=[torch.tensor(b, dtype=torch.float32) for b in basis_history],
                             progress_callback=mock_progress.callback if mock_progress is not None else None,
+                            replay_buffer=sacr_replay_buffer,
                         )
                     except TypeError as exc:
-                        if "progress_callback" not in str(exc):
+                        exc_str = str(exc)
+                        _has_cb_err = "unexpected keyword argument 'progress_callback'" in exc_str
+                        _has_buf_err = "unexpected keyword argument 'replay_buffer'" in exc_str
+                        if not (_has_cb_err or _has_buf_err):
                             raise
-                        self._mock_model, phase_metrics = run_mock_task_training(
-                            model=self._mock_model,
-                            task=task,
-                            cfg=phase_cfg,
-                            basis_history=[torch.tensor(b, dtype=torch.float32) for b in basis_history],
-                        )
+                        if _has_buf_err and not _has_cb_err:
+                            self._mock_model, phase_metrics = run_mock_task_training(
+                                model=self._mock_model,
+                                task=task,
+                                cfg=phase_cfg,
+                                basis_history=[torch.tensor(b, dtype=torch.float32) for b in basis_history],
+                                progress_callback=mock_progress.callback if mock_progress is not None else None,
+                            )
+                        elif _has_cb_err and not _has_buf_err:
+                            try:
+                                self._mock_model, phase_metrics = run_mock_task_training(
+                                    model=self._mock_model,
+                                    task=task,
+                                    cfg=phase_cfg,
+                                    basis_history=[torch.tensor(b, dtype=torch.float32) for b in basis_history],
+                                    replay_buffer=sacr_replay_buffer,
+                                )
+                            except TypeError:
+                                self._mock_model, phase_metrics = run_mock_task_training(
+                                    model=self._mock_model,
+                                    task=task,
+                                    cfg=phase_cfg,
+                                    basis_history=[torch.tensor(b, dtype=torch.float32) for b in basis_history],
+                                )
+                        else:
+                            self._mock_model, phase_metrics = run_mock_task_training(
+                                model=self._mock_model,
+                                task=task,
+                                cfg=phase_cfg,
+                                basis_history=[torch.tensor(b, dtype=torch.float32) for b in basis_history],
+                            )
                     if mock_progress is not None:
                         print(
                             "[open-continual] "
@@ -959,7 +993,7 @@ class OpenContinualTrainer:
                 p1 = run_phase1_hciba(task.task_id, phase_cfg, batch=batch)
                 p2 = run_phase2_joint(task.task_id, phase_cfg, batch=batch)
                 p3 = run_phase3_subspace_and_fusion(task.task_id, phase_cfg, batch=batch, prev_phase_metrics=p1)
-                p4 = run_phase4_replay_update(task.task_id, phase_cfg, batch=batch)
+                p4 = run_phase4_replay_update(task.task_id, phase_cfg, batch=batch, replay_buffer=sacr_replay_buffer)
 
             current_basis = p3.get("subspace_basis", [])
             p3["omega_tau_t"] = float(_compute_omega_tau_t(current_basis, basis_history))
@@ -1039,7 +1073,7 @@ class OpenContinualTrainer:
                 p1 = run_phase1_hciba(task.task_id, phase_cfg, batch=d2_batch)
                 p2 = run_phase2_joint(task.task_id, phase_cfg, batch=d2_batch)
                 p3 = run_phase3_subspace_and_fusion(task.task_id, phase_cfg, batch=d2_batch, prev_phase_metrics=p1)
-                p4 = run_phase4_replay_update(task.task_id, phase_cfg, batch=d2_batch)
+                p4 = run_phase4_replay_update(task.task_id, phase_cfg, batch=d2_batch, replay_buffer=sacr_replay_buffer)
                 current_basis = p3.get("subspace_basis", [])
                 p3["omega_tau_t"] = float(_compute_omega_tau_t(current_basis, basis_history))
                 for record in (p1, p2, p3, p4):

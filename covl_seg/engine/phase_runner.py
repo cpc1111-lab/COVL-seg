@@ -256,6 +256,7 @@ def run_phase4_replay_update(
     task_id: int,
     cfg: Dict[str, object],
     batch: Optional[Dict[str, object]] = None,
+    replay_buffer: Optional[SACRReplayBuffer] = None,
 ) -> Dict[str, float]:
     """Phase 4: SACR replay buffer update.
 
@@ -273,7 +274,7 @@ def run_phase4_replay_update(
     rho_new = max(0.0, float(cfg.get("balanced_rho_new", 0.0)))
     rho_old = max(0.0, float(cfg.get("balanced_rho_old", 0.0)))
 
-    buffer = SACRReplayBuffer(max_total_items=max_total, max_per_class=max_per_class)
+    buffer = replay_buffer if replay_buffer is not None else SACRReplayBuffer(max_total_items=max_total, max_per_class=max_per_class)
 
     generator = torch.Generator().manual_seed(4000 + task_id)
     features_c = _to_tensor(

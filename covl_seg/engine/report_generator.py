@@ -132,6 +132,7 @@ def _fig_perf_forgetting_run(records: List[Dict[str, float]], output_dir: Path) 
     tasks = []
     cumulative_bwt = []
     cum_sum = 0.0
+    prev_miou_old: Optional[float] = None
 
     for i, rec in enumerate(eval_records):
         task_val = rec.get("task")
@@ -140,8 +141,6 @@ def _fig_perf_forgetting_run(records: List[Dict[str, float]], output_dir: Path) 
         try:
             task = int(task_val)
         except (ValueError, TypeError):
-            continue
-        if task <= 1:
             continue
 
         current_miou_new = _safe_float(rec.get("mIoU_new"))
@@ -160,18 +159,24 @@ def _fig_perf_forgetting_run(records: List[Dict[str, float]], output_dir: Path) 
                     tasks.append(task)
             continue
 
-        bwt = current_miou_new - current_miou_old
-        backward_transfer.append(bwt)
-        cum_sum += bwt
-        cumulative_bwt.append(cum_sum)
-        tasks.append(task)
+        if task <= 1:
+            prev_miou_old = current_miou_old
+            continue
+
+        if prev_miou_old is not None:
+            bwt = current_miou_old - prev_miou_old
+            backward_transfer.append(bwt)
+            cum_sum += bwt
+            cumulative_bwt.append(cum_sum)
+            tasks.append(task)
+        prev_miou_old = current_miou_old
 
     if not tasks:
         _log.warning("[report] skipped fig_perf_forgetting: no valid data")
         return None
 
     fig, ax1 = plt.subplots(figsize=(10, 5))
-    ax1.bar(tasks, backward_transfer, color="tab:red", alpha=0.7, label="BWT (mIoU_new - mIoU_old)")
+    ax1.bar(tasks, backward_transfer, color="tab:red", alpha=0.7, label="BWT (mIoU_old(t) - mIoU_old(t-1))")
     ax1.set_xlabel("Task")
     ax1.set_ylabel("Backward Transfer", color="tab:red")
     ax1.tick_params(axis="y", labelcolor="tab:red")
@@ -224,22 +229,21 @@ def _fig_perf_stability_plasticity_run(records: List[Dict[str, float]], output_d
         _log.warning("[report] skipped fig_perf_stability_plasticity: no valid data")
         return None
 
-    fig, ax = plt.subplots(figsize=(8, 8))
+    fig, ax = plt.subplots(figsize=(10, 5))
     ax.scatter(xs_old, ys_old, c="tab:blue", marker="s", s=60, label="mIoU_old (Stability)", alpha=0.7)
     ax.scatter(xs_new, ys_new, c="tab:orange", marker="^", s=60, label="mIoU_new (Plasticity)", alpha=0.7)
-
-    min_val = min(min(ys_old or [0]), min(ys_new or [0]))
-    max_val = max(max(ys_old or [100]), max(ys_new or [100]))
-    ax.plot([min_val, max_val], [min_val, max_val], "k--", linewidth=0.5, label="Reference (y=x)")
 
     ax.set_xlabel("Task")
     ax.set_ylabel("mIoU")
     ax.set_title("Stability (mIoU_old) vs Plasticity (mIoU_new)")
     ax.grid(alpha=0.3)
     ax.legend()
-    ax.set_xlim(min_val - 5, max_val + 5)
-    ax.set_ylim(min_val - 5, max_val + 5)
-    ax.set_aspect("equal")
+    all_xs = xs_old + xs_new
+    if all_xs:
+        x_min, x_max = min(all_xs), max(all_xs)
+        x_pad = max(0.5, (x_max - x_min) * 0.1)
+        ax.set_xlim(x_min - x_pad, x_max + x_pad)
+    ax.set_ylim(0, 100)
     plt.tight_layout()
 
     out_path = output_dir / "fig_perf_stability_plasticity.png"
