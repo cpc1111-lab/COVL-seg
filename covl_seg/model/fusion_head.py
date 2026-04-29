@@ -16,7 +16,7 @@ class ContinualFusionHead(nn.Module):
         self.feature_dim = feature_dim
         self.alpha = nn.Parameter(torch.tensor(0.5))
         self.tau = nn.Parameter(torch.tensor(1.0))
-        self.text_proj = nn.Linear(feature_dim, feature_dim)
+        self.text_proj = nn.Linear(feature_dim, feature_dim, bias=False)
 
     def forward(
         self,
@@ -26,7 +26,6 @@ class ContinualFusionHead(nn.Module):
     ) -> torch.Tensor:
         alpha = torch.sigmoid(self.alpha)
         tau = F.softplus(self.tau) + 0.1
-        eps = 1e-8
 
         if clip_logits.shape[-2:] != backbone_logits.shape[-2:]:
             clip_logits = F.interpolate(
@@ -40,6 +39,7 @@ class ContinualFusionHead(nn.Module):
         p_clip = F.softmax(clip_logits, dim=1)
 
         fused = alpha * p_backbone + (1 - alpha) * p_clip
-        output = torch.log(fused + eps) * tau
+        fused = fused.clamp(min=1e-6)
+        output = torch.log(fused) * tau
 
         return output

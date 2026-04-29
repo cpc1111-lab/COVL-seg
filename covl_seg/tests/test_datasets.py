@@ -157,4 +157,6 @@ class TestCOCOStuffDataset:
 
         ds = COCOStuffDataset(root=str(tmp_path), split="training", num_classes=164)
         sample = ds[0]
-        assert sample["sem_seg"].max() <= 163
+        out_of_range = (sample["sem_seg"] >= 164) & (sample["sem_seg"] != 255)
+        assert out_of_range.sum() == 0, "Out-of-range labels should be mapped to 255"
+        assert (sample["sem_seg"] == 255).all(), "All pixels with value 200 (>=164) should become 255"

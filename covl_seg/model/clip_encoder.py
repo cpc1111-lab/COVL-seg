@@ -1,7 +1,25 @@
+import logging
 from typing import List, Optional
 
 import torch
 from torch import nn
+
+_log = logging.getLogger(__name__)
+
+_CLIP_INSTANCE_CACHE: dict = {}
+
+
+def _create_or_get_clip(model_name: str, pretrained: str):
+    """Create or retrieve a cached CLIP model to share between visual and text encoders."""
+    import open_clip
+
+    cache_key = (model_name, pretrained)
+    if cache_key not in _CLIP_INSTANCE_CACHE:
+        model, _, _ = open_clip.create_model_and_transforms(
+            model_name, pretrained=pretrained, force_quick_gelu=True
+        )
+        _CLIP_INSTANCE_CACHE[cache_key] = model
+    return _CLIP_INSTANCE_CACHE[cache_key]
 
 
 class CLIPVisualEncoder(nn.Module):
@@ -13,16 +31,18 @@ class CLIPVisualEncoder(nn.Module):
         pretrained: str = "openai",
         clip_finetune: str = "none",
         hook_layers: Optional[List[int]] = None,
+        shared_clip: Optional[object] = None,
     ):
         super().__init__()
-        import open_clip
-
         self._model_name = model_name
         self._pretrained = pretrained
-        model, _, _ = open_clip.create_model_and_transforms(model_name, pretrained=pretrained)
-        self.clip_model = model
-        self.visual = model.visual
 
+        if shared_clip is not None:
+            self.clip_model = shared_clip
+        else:
+            self.clip_model = _create_or_get_clip(model_name, pretrained)
+
+        self.visual = self.clip_model.visual
         self.dim = self.visual.transformer.width
         self.intermediate_features: List[torch.Tensor] = []
 
@@ -53,6 +73,10 @@ class CLIPVisualEncoder(nn.Module):
         elif mode == "attention":
             for name, param in self.clip_model.named_parameters():
                 if "attn" in name:
+                    param.requires_grad = True
+        elif mode == "v_only":
+            for name, param in self.clip_model.named_parameters():
+                if name.startswith("visual."):
                     param.requires_grad = True
         elif mode == "prompt":
             pass
@@ -85,28 +109,58 @@ class CLIPVisualEncoder(nn.Module):
 
 
 class CLIPTextEncoder(nn.Module):
-    """CLIP text encoder producing learnable embeddings from class names."""
+    """CLIP text encoder with configurable fine-tuning modes."""
+
+    _VALID_FINETUNE_MODES = {"none", "attention", "full"}
 
     def __init__(
         self,
         model_name: str = "ViT-B-16",
         pretrained: str = "openai",
         output_dim: Optional[int] = None,
+        clip_finetune: str = "attention",
+        shared_clip: Optional[object] = None,
     ):
         super().__init__()
+        self._model_name = model_name
+        self._pretrained = pretrained
+
+        if shared_clip is not None:
+            self.clip_model = shared_clip
+        else:
+            self.clip_model = _create_or_get_clip(model_name, pretrained)
+
         import open_clip
 
-        model, _, _ = open_clip.create_model_and_transforms(model_name, pretrained=pretrained)
-        self.clip_model = model
         self.tokenizer = open_clip.get_tokenizer(model_name)
-        self.text_dim = model.transformer.width
+        self.text_dim = self.clip_model.transformer.width
         if output_dim is None:
-            output_dim = model.visual.transformer.width
+            output_dim = self.clip_model.visual.transformer.width
         self.output_dim = output_dim
         self.text_projection_layer = nn.Linear(self.text_dim, output_dim, bias=False)
 
+        self._apply_finetune_mode(clip_finetune)
+
+    def _apply_finetune_mode(self, mode: str):
+        mode = mode.lower()
+        if mode not in self._VALID_FINETUNE_MODES:
+            raise ValueError(
+                f"Unknown clip_finetune mode: {mode}. "
+                f"Valid modes: {sorted(self._VALID_FINETUNE_MODES)}"
+            )
+
         for param in self.clip_model.parameters():
-            param.requires_grad = True
+            param.requires_grad = False
+
+        if mode == "full":
+            for param in self.clip_model.parameters():
+                param.requires_grad = True
+        elif mode == "attention":
+            for name, param in self.clip_model.named_parameters():
+                if "attn" in name or "text_projection" in name:
+                    param.requires_grad = True
+
+        self.text_projection_layer.weight.requires_grad = True
 
     def forward(self, class_names: List[str]) -> torch.Tensor:
         tokens = self.tokenizer(class_names)

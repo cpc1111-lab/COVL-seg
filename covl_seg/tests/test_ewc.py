@@ -15,14 +15,16 @@ def _make_loader(n_batches=5, batch_size=3):
             return self.length
 
         def __getitem__(self, idx):
-            return torch.randn(4), torch.randint(0, 2, (1,)).item()
+            return {"image": torch.randn(4), "sem_seg": torch.randint(0, 2, (1,)).item()}
 
     ds = _DS(n_batches * batch_size)
     return torch.utils.data.DataLoader(ds, batch_size=batch_size)
 
 
-def _loss_fn(outputs, targets):
-    return nn.functional.cross_entropy(outputs, targets)
+def _make_loss_fn(model):
+    def loss_fn(images, targets):
+        return nn.functional.cross_entropy(model(images), targets)
+    return loss_fn
 
 
 def test_ewc_computes_fisher():
@@ -31,7 +33,7 @@ def test_ewc_computes_fisher():
     model = _make_model()
     reg = EWCRegularizer(model, lambda_ewc=10.0)
     loader = _make_loader()
-    reg.compute_fisher(loader, _loss_fn, n_samples=5)
+    reg.compute_fisher(loader, _make_loss_fn(model), n_samples=5)
 
     fisher_vals = torch.cat([v.flatten() for v in reg._fisher.values()])
     assert (fisher_vals > 0).any(), "Fisher diagonal should be non-zero for trainable params"
@@ -43,7 +45,7 @@ def test_ewc_no_penalty_before_consolidate():
     model = _make_model()
     reg = EWCRegularizer(model, lambda_ewc=10.0)
     loader = _make_loader()
-    reg.compute_fisher(loader, _loss_fn, n_samples=5)
+    reg.compute_fisher(loader, _make_loss_fn(model), n_samples=5)
 
     penalty = reg.penalty(model)
     assert penalty.item() == 0.0, "Penalty must be 0 before consolidate"
@@ -55,7 +57,7 @@ def test_ewc_loss_penalizes_drift():
     model = _make_model()
     reg = EWCRegularizer(model, lambda_ewc=10.0)
     loader = _make_loader()
-    reg.compute_fisher(loader, _loss_fn, n_samples=5)
+    reg.compute_fisher(loader, _make_loss_fn(model), n_samples=5)
     reg.consolidate()
 
     with torch.no_grad():
@@ -72,7 +74,7 @@ def test_ewc_state_dict_roundtrip():
     model = _make_model()
     reg = EWCRegularizer(model, lambda_ewc=10.0)
     loader = _make_loader()
-    reg.compute_fisher(loader, _loss_fn, n_samples=5)
+    reg.compute_fisher(loader, _make_loss_fn(model), n_samples=5)
     reg.consolidate()
 
     penalty_before = reg.penalty(model).item()

@@ -1,5 +1,5 @@
 from collections import OrderedDict
-from typing import Callable
+from typing import Callable, Optional
 
 import torch
 import torch.nn as nn
@@ -15,13 +15,13 @@ class EWCRegularizer:
     def __init__(self, model: nn.Module, lambda_ewc: float = 10.0):
         self._model = model
         self.lambda_ewc = lambda_ewc
+        self._device = next(model.parameters()).device
         self._trainable_names = [
             n for n, p in model.named_parameters() if p.requires_grad
         ]
         self._fisher: OrderedDict[str, torch.Tensor] = OrderedDict()
-        self._optimal_params: OrderedDict[str, torch.Tensor] | None = None
+        self._optimal_params: Optional[OrderedDict[str, torch.Tensor]] = None
 
-    @torch.no_grad()
     def compute_fisher(
         self,
         data_loader: torch.utils.data.DataLoader,
@@ -36,17 +36,26 @@ class EWCRegularizer:
             if count >= n_samples:
                 break
 
-            inputs, targets = batch
+            if isinstance(batch, dict):
+                images = batch["image"].to(self._device, non_blocking=True)
+                targets = batch["sem_seg"].to(self._device, non_blocking=True)
+            elif isinstance(batch, (list, tuple)):
+                images, targets = batch
+                images = images.to(self._device, non_blocking=True)
+                targets = targets.to(self._device, non_blocking=True)
+            else:
+                images, targets = batch
+                images = images.to(self._device, non_blocking=True)
+                targets = targets.to(self._device, non_blocking=True)
             self._model.zero_grad()
-
             with torch.enable_grad():
-                outputs = self._model(inputs)
-                loss = loss_fn(outputs, targets)
-
+                loss = loss_fn(images, targets)
             loss.backward()
 
             for name in self._trainable_names:
                 p = dict(self._model.named_parameters())[name]
+                if p.grad is None:
+                    continue
                 grad_sq = (p.grad ** 2).detach()
                 if accum[name] is None:
                     accum[name] = grad_sq.clone()
@@ -83,13 +92,16 @@ class EWCRegularizer:
         return {
             "lambda_ewc": self.lambda_ewc,
             "fisher": OrderedDict(
-                (k, v.clone()) for k, v in self._fisher.items()
+                (k, v.clone()) for k, v in self._fisher.items() if v is not None
             ),
             "optimal_params": OrderedDict(
                 (k, v.clone()) for k, v in self._optimal_params.items()
             )
             if self._optimal_params is not None
             else None,
+            "fisher_names": list(
+                k for k, v in self._fisher.items() if v is not None
+            ),
         }
 
     def load_state_dict(self, state):

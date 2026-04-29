@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Callable, Dict, List, Optional
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
@@ -43,8 +44,10 @@ from covl_seg.engine.phase_runner import (
     run_phase4_replay_update,
 )
 from covl_seg.model.covl_seg_model_new import COVLSegModelV2
-from covl_seg.data.datasets import ADE20KDataset, COCOStuffDataset
+from covl_seg.data.datasets import ADE20KDataset, COCOStuffDataset, SegmentationAugmentation, SegmentationEvalTransform, COCO_STUFF_164_CLASSES, ClassFilteredDataset
 from covl_seg.continual.ewc import EWCRegularizer
+from covl_seg.continual.replay_buffer import ReplayItem, SACRReplayBuffer
+from covl_seg.continual.spectral_ogp import compute_gradient_basis, unflatten_and_project, hard_project_gradient, flatten_gradients
 
 
 def _infer_num_classes_from_config(config_path: str, *, strict: bool) -> int:
@@ -667,6 +670,11 @@ class OpenContinualTrainer:
     text_learning_rate: float = 1e-5
     batch_size: int = 4
     dataset_root: str = "datasets/ADE20K"
+    image_size: int = 518
+    lr_scheduler: str = "cosine"
+    num_workers: int = 4
+    use_amp: bool = True
+    eval_max_samples: int = 500
     _mock_model: Optional[nn.Module] = field(default=None, init=False, repr=False)
 
     @classmethod
@@ -720,6 +728,11 @@ class OpenContinualTrainer:
             text_learning_rate=getattr(args, "text_learning_rate", 1e-5),
             batch_size=getattr(args, "batch_size", 4),
             dataset_root=getattr(args, "dataset_root", "datasets/ADE20K"),
+            image_size=getattr(args, "image_size", 518),
+            lr_scheduler=getattr(args, "lr_scheduler", "cosine"),
+            num_workers=getattr(args, "num_workers", 4),
+            use_amp=getattr(args, "use_amp", True),
+            eval_max_samples=getattr(args, "eval_max_samples", 500),
         )
 
     def _resolve_task_main_iters(self, task: TaskDef) -> int:
@@ -739,35 +752,94 @@ class OpenContinualTrainer:
         cap_iters = max(base_iters, int(round(base_iters * float(self.max_iters_multiplier))))
         return int(max(base_iters, min(target_iters, cap_iters)))
 
+    def _resolve_total_classes(self) -> int:
+        config_lower = self.config_path.lower()
+        if "coco" in config_lower:
+            return 164
+        if "ade" in config_lower:
+            return 150
+        return max(self.classes_per_task or 1, self.num_tasks or 1) * (self.classes_per_task or 15)
+
     def _build_model(self, num_classes: int) -> COVLSegModelV2:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        print(f"[open-continual] building model on {device} (clip={self.clip_model_name}, dino={self.dino_model_name})")
         model = COVLSegModelV2(
             clip_model_name=self.clip_model_name,
             dino_model_name=self.dino_model_name,
             clip_finetune=self.clip_finetune,
             num_classes=num_classes,
         )
+        model = model.to(device)
+        n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        print(f"[open-continual] model initialized ({n_params:,} trainable params)")
         return model
 
-    def _build_dataloader(self, task: TaskDef) -> DataLoader:
-        class_names = [f"class_{c}" for c in task.seen_classes]
+    def _get_all_class_names(self) -> List[str]:
         config_lower = self.config_path.lower()
+        total = self._resolve_total_classes()
         if "coco" in config_lower:
-            dataset = COCOStuffDataset(
-                root=self.dataset_root,
-                split="training",
-                class_names=class_names,
-                num_classes=max(task.seen_classes) + 1 if task.seen_classes else 164,
-            )
-        else:
-            dataset = ADE20KDataset(
-                root=self.dataset_root,
-                split="training",
-                class_names=class_names,
-            )
-        return DataLoader(dataset, batch_size=self.batch_size, shuffle=True, num_workers=0)
+            total = min(total, len(COCO_STUFF_164_CLASSES))
+            return COCO_STUFF_164_CLASSES[:total]
+        return [f"class_{i}" for i in range(total)]
 
-    def _train_task(self, model: COVLSegModelV2, dataloader: DataLoader, ewc: Optional[EWCRegularizer] = None) -> Dict[str, float]:
+    def _build_dataloader(self, task: TaskDef, mode: str = "train", class_names: Optional[List[str]] = None, replay_buffer: Optional[SACRReplayBuffer] = None) -> DataLoader:
+        if class_names is None:
+            class_names = self._get_all_class_names()
+        config_lower = self.config_path.lower()
+        augment = SegmentationAugmentation(image_size=self.image_size) if mode == "train" else None
+        eval_transform = SegmentationEvalTransform(image_size=self.image_size) if mode == "eval" else None
+        num_classes = self._resolve_total_classes()
+        visible_class_ids = list(task.seen_classes) if mode == "train" else None
+
+        _log.info("[dataloader] mode=%s dataset=%s seed=%d split=%s n_classes=%d", mode, "coco" if "coco" in config_lower else "ade", task.task_id, "train" if mode == "train" else "val", num_classes)
+        print(f"[open-continual] task {task.task_id} loading {mode} dataset from {self.dataset_root} ...", flush=True)
+
+        dataset_kwargs = dict(
+            root=self.dataset_root,
+            split="training" if mode == "train" else "validation",
+            class_names=class_names,
+            num_classes=num_classes,
+            augmentation=augment or eval_transform,
+        )
+
+        if "coco" in config_lower:
+            DatasetClass = COCOStuffDataset
+        else:
+            DatasetClass = ADE20KDataset
+
+        try:
+            dataset = DatasetClass(**dataset_kwargs, visible_class_ids=visible_class_ids)
+        except TypeError:
+            dataset = DatasetClass(**dataset_kwargs)
+
+        if mode == "train" and visible_class_ids is not None and not isinstance(dataset, (ClassFilteredDataset, torch.utils.data.Subset)):
+            try:
+                dataset = ClassFilteredDataset(
+                    dataset,
+                    visible_class_ids=visible_class_ids,
+                    min_visible_ratio=0.01,
+                )
+                print(f"[open-continual] task {task.task_id} filtered {mode} dataset: {len(dataset)} samples with {len(visible_class_ids)} classes", flush=True)
+            except Exception:
+                pass
+
+        if mode == "eval" and self.eval_max_samples > 0 and len(dataset) > self.eval_max_samples:
+            indices = torch.randperm(len(dataset))[:self.eval_max_samples].tolist()
+            dataset = torch.utils.data.Subset(dataset, indices)
+
+        n_samples = len(dataset)
+        print(f"[open-continual] task {task.task_id} {mode} dataset ready: {n_samples} samples", flush=True)
+        return DataLoader(dataset, batch_size=self.batch_size, shuffle=(mode == "train"), num_workers=self.num_workers, pin_memory=True)
+
+    def _train_task(self, model: COVLSegModelV2, dataloader: DataLoader, class_names: List[str], ewc: Optional[EWCRegularizer] = None, task_id: int = 0, optimizer_state: Optional[dict] = None, seen_class_ids: Optional[List[int]] = None, unseen_class_ids: Optional[List[int]] = None, ciba_weight: float = 0.0, ctr_weight: float = 0.0, ogp_basis: Optional[torch.Tensor] = None) -> tuple:
+        device = next(model.parameters()).device
+        use_amp = self.use_amp and device.type == "cuda"
         model.train()
+
+        if self.clip_finetune in ("none", "attention"):
+            model.clip_visual.eval()
+        model.dino.eval()
+
         optimizer = torch.optim.AdamW([
             {"params": model.hciba_head.parameters()},
             {"params": model.fusion_head.parameters()},
@@ -775,44 +847,154 @@ class OpenContinualTrainer:
             {"params": model.clip_text.parameters(), "lr": self.text_learning_rate},
         ], lr=self.learning_rate)
 
-        total_loss = 0.0
-        n_batches = 0
-        for batch in dataloader:
-            images = batch["image"]
-            targets = batch["sem_seg"]
-            class_names = batch["class_names"][0]
+        if self.clip_finetune in ("attention", "full"):
+            existing_ids = {id(p) for group in optimizer.param_groups for p in group["params"]}
+            visual_params = [p for p in model.clip_visual.parameters() if p.requires_grad and id(p) not in existing_ids]
+            if visual_params:
+                optimizer.add_param_group({"params": visual_params, "lr": self.learning_rate * 0.1})
 
-            optimizer.zero_grad()
-            outputs = model(images, class_names, targets=targets)
-            loss = outputs["loss"]
+        if optimizer_state is not None:
+            optimizer.load_state_dict(optimizer_state)
+
+        n_batches = 0
+        max_batches = self.n_main
+        warmup_steps = min(500, max_batches // 10)
+        if self.lr_scheduler == "cosine" and max_batches > 0:
+            base_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max_batches - warmup_steps, eta_min=self.learning_rate * 0.01)
+            scheduler = torch.optim.lr_scheduler.SequentialLR(
+                optimizer,
+                schedulers=[
+                    torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=0.01, total_iters=warmup_steps),
+                    base_scheduler,
+                ],
+                milestones=[warmup_steps],
+            )
+        else:
+            scheduler = None
+
+        scaler = torch.cuda.amp.GradScaler(enabled=use_amp) if use_amp else None
+        total_loss = 0.0
+        pbar = tqdm(dataloader, desc=f"task {task_id} train", total=max_batches, leave=True)
+        for batch in pbar:
+            images = batch["image"].to(device, non_blocking=True)
+            targets = batch["sem_seg"].to(device, non_blocking=True)
+            optimizer.zero_grad(set_to_none=True)
+
+            mi_estimate = None
+            if ciba_weight > 0.0:
+                with torch.no_grad():
+                    mi_estimate = torch.tensor(0.0, device=device)
+
+            forward_kwargs = {"targets": targets}
+            if seen_class_ids is not None and hasattr(model, 'compute_ctr_loss'):
+                forward_kwargs["seen_class_ids"] = seen_class_ids
+                forward_kwargs["unseen_class_ids"] = unseen_class_ids
+                forward_kwargs["mi_estimate"] = mi_estimate
+                forward_kwargs["ciba_weight"] = ciba_weight
+                forward_kwargs["ctr_weight"] = ctr_weight
+
+            with torch.cuda.amp.autocast(enabled=use_amp):
+                outputs = model(
+                    images=images,
+                    class_names=class_names,
+                    **forward_kwargs,
+                )
+                loss = outputs["loss"]
+
+            if loss is not None and (torch.isnan(loss) or torch.isinf(loss)):
+                _log.warning("[open-continual] NaN/Inf loss at task %d batch %d, skipping update", task_id, n_batches)
+                with torch.no_grad():
+                    for k, v in outputs.items():
+                        if isinstance(v, torch.Tensor):
+                            print(f"  [{k}] shape={tuple(v.shape)} min={v.min():.3f} max={v.max():.3f} mean={v.mean():.3f} nan={torch.isnan(v).any().item()} inf={torch.isinf(v).any().item()}", flush=True)
+                    print(f"  [images] min={images.min():.3f} max={images.max():.3f} mean={images.mean():.3f}", flush=True)
+                    print(f"  [targets] min={targets.min().item()} max={targets.max().item()} unique={targets.unique().tolist()}", flush=True)
+                    for name, param in model.named_parameters():
+                        if param.grad is not None and (torch.isnan(param.grad).any() or torch.isinf(param.grad).any()):
+                            print(f"  [GRAD NaN/Inf] {name} shape={tuple(param.shape)}", flush=True)
+                n_batches += 1
+                continue
 
             if ewc is not None:
                 loss = loss + ewc.penalty(model)
 
-            loss.backward()
-            optimizer.step()
+            if scaler is not None:
+                scaler.scale(loss).backward()
+                if ogp_basis is not None:
+                    grad_vec = flatten_gradients(model)
+                    if grad_vec.numel() == ogp_basis.shape[0]:
+                        projected = hard_project_gradient(grad_vec, ogp_basis)
+                        offset = 0
+                        for param in model.parameters():
+                            if param.grad is not None:
+                                numel = param.grad.numel()
+                                if offset + numel <= projected.shape[0]:
+                                    param.grad.copy_(projected[offset:offset + numel].view_as(param.grad))
+                                offset += numel
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                loss.backward()
+                if ogp_basis is not None:
+                    unflatten_and_project(model, flatten_gradients(model), ogp_basis)
+                optimizer.step()
+            if scheduler is not None:
+                scheduler.step()
             total_loss += loss.item()
             n_batches += 1
-            if n_batches >= self.n_main:
+            avg_loss = total_loss / n_batches
+            pbar.set_postfix(loss=f"{avg_loss:.4f}", lr=f"{optimizer.param_groups[0]['lr']:.2e}")
+            if n_batches >= max_batches:
                 break
+        pbar.close()
 
-        return {"train_loss": total_loss / max(n_batches, 1), "n_batches": float(n_batches)}
+        return {"train_loss": total_loss / max(n_batches, 1), "n_batches": float(n_batches)}, optimizer, scheduler
 
-    def _eval_task(self, model: COVLSegModelV2, dataloader: DataLoader, class_names: List[str]) -> Dict[str, float]:
+    def _eval_task(self, model: COVLSegModelV2, dataloader: DataLoader, class_names: List[str], task_id: int = 0, seen_class_ids: Optional[List[int]] = None) -> Dict[str, float]:
+        device = next(model.parameters()).device
+        use_amp = self.use_amp and device.type == "cuda"
         model.eval()
+        num_classes = model.num_classes
+        # Evaluate only on seen classes (not all classes)
+        eval_class_ids = list(range(num_classes)) if seen_class_ids is None else sorted(c for c in seen_class_ids if c < num_classes)
+        n_eval_classes = len(eval_class_ids) if eval_class_ids else num_classes
         correct = 0
         total = 0
+        conf_matrix = torch.zeros(n_eval_classes, n_eval_classes, dtype=torch.long)
+        # Build index mapping: global class id → eval matrix index
+        global_to_eval = {gid: eid for eid, gid in enumerate(eval_class_ids)}
         with torch.no_grad():
-            for batch in dataloader:
-                images = batch["image"]
-                targets = batch["sem_seg"]
-                outputs = model(images, class_names)
-                preds = outputs["logits"].argmax(dim=1)
+            for batch in tqdm(dataloader, desc=f"task {task_id} eval", leave=True):
+                images = batch["image"].to(device, non_blocking=True)
+                targets = batch["sem_seg"].to(device, non_blocking=True)
+                with torch.cuda.amp.autocast(enabled=use_amp):
+                    outputs = model(images, class_names, targets=targets)
+                if targets is not None:
+                    preds = F.interpolate(outputs["logits"], size=targets.shape[-2:], mode="bilinear", align_corners=False).argmax(dim=1)
+                else:
+                    preds = outputs["logits"].argmax(dim=1)
                 mask = targets != 255
+                if seen_class_ids is not None:
+                    seen_set = set(seen_class_ids)
+                    class_mask = torch.isin(targets, torch.tensor(list(seen_set), device=targets.device))
+                    mask = mask & class_mask
                 correct += (preds[mask] == targets[mask]).sum().item()
                 total += mask.sum().item()
+                valid = mask
+                pred_valid = preds[valid].clamp(0, num_classes - 1)
+                tgt_valid = targets[valid].clone()
+                tgt_valid[(tgt_valid >= num_classes)] = num_classes - 1
+                # Remap both to eval matrix indices
+                for p, t in zip(pred_valid.tolist(), tgt_valid.tolist()):
+                    ep = global_to_eval.get(p)
+                    et = global_to_eval.get(t)
+                    if ep is not None and et is not None:
+                        conf_matrix[ep, et] += 1
         accuracy = correct / max(total, 1)
-        return {"accuracy": accuracy, "total_pixels": float(total)}
+        iou_per_class = conf_matrix.diag().float() / (conf_matrix.sum(0) + conf_matrix.sum(1) - conf_matrix.diag()).float().clamp(min=1)
+        present = (conf_matrix.sum(0) + conf_matrix.sum(1)) > 0
+        miou = iou_per_class[present].mean().item() if present.any() else 0.0
+        return {"accuracy": accuracy, "mIoU": miou * 100.0, "total_pixels": float(total), "eval_classes": n_eval_classes}
 
     def _build_task_plan(self) -> TaskPlan:
         total_classes = _infer_num_classes_from_config(
@@ -991,6 +1173,12 @@ class OpenContinualTrainer:
                 self._mock_model.load_state_dict(model_state_dict)
 
         completed = 0
+        task_pbar = tqdm(
+            total=len(plan.tasks) - sum(1 for t in plan.tasks if t.task_id <= self.resume_task),
+            desc="continual tasks",
+            unit="task",
+            leave=True,
+        )
         for task in plan.tasks:
             if task.task_id <= self.resume_task:
                 continue
@@ -1026,21 +1214,81 @@ class OpenContinualTrainer:
                     "balanced_rho_old": float(balanced_state.rho_old),
                 }
             phase_cfg = {**task_cfg, **method_phase_cfg, **balanced_knobs, "n_main": task_main_iters}
+            print(
+                f"\n[open-continual] === Task {task.task_id}/{total_tasks} === "
+                f"new_classes={len(task.new_classes)} seen_classes={len(task.seen_classes)} "
+                f"bg_classes={len(task.background_classes)} iters={task_main_iters}"
+            )
+
             model = None
             ewc = None
             dataloader = None
+            replay_buffer = None
+            ogp_basis_tensor = None
             if self.use_real_training:
-                model = self._build_model(num_classes=len(task.seen_classes))
-                if task.task_id > 1 and (self.output_dir / f"task_{task.task_id - 1:03d}" / "model.pt").exists():
-                    ckpt = torch.load(self.output_dir / f"task_{task.task_id - 1:03d}" / "model.pt", map_location="cpu")
+                print(f"[open-continual] task {task.task_id}/{total_tasks} building model...")
+                all_class_names = self._get_all_class_names()
+                total_classes = len(all_class_names)
+                model = self._build_model(num_classes=total_classes)
+                print(f"[open-continual] task {task.task_id}/{total_tasks} model ready (device={next(model.parameters()).device}, classes={total_classes})")
+                optimizer_state = None
+                ewc_state_from_ckpt = None
+                prev_ckpt_path = self.output_dir / f"task_{task.task_id - 1:03d}" / "model.pt" if task.task_id > 1 else None
+                if prev_ckpt_path is not None and prev_ckpt_path.exists():
+                    ckpt = torch.load(prev_ckpt_path, map_location="cpu", weights_only=False)
                     model.load_state_dict(ckpt["model_state_dict"], strict=False)
                     if "alpha_star" in ckpt:
                         model.inject_alpha_tau(ckpt["alpha_star"], ckpt.get("tau_pred", 1.0))
-                dataloader = self._build_dataloader(task)
-                train_metrics = self._train_task(model, dataloader, ewc=ewc)
+                    if "optimizer_state_dict" in ckpt and ckpt["optimizer_state_dict"] is not None:
+                        optimizer_state = ckpt["optimizer_state_dict"]
+                    if "ewc_state_dict" in ckpt and ckpt["ewc_state_dict"] is not None:
+                        ewc_state_from_ckpt = ckpt["ewc_state_dict"]
+                    print(f"[open-continual] task {task.task_id}/{total_tasks} resumed from {prev_ckpt_path}")
+
+                if self.enable_sacr and task.task_id > 1:
+                    replay_path = self.output_dir / f"task_{task.task_id - 1:03d}" / "replay_buffer.json"
+                    if replay_path.exists():
+                        replay_buffer = SACRReplayBuffer.load(replay_path)
+
+                if self.enable_spectral_ogp and task.task_id > 1:
+                    basis_path = self.output_dir / f"task_{task.task_id - 1:03d}" / "ogp_basis.pt"
+                    if basis_path.exists():
+                        ogp_basis_tensor = torch.load(basis_path, map_location="cpu", weights_only=False)
+
+                seen_class_ids = [int(c) for c in task.seen_classes]
+                unseen_class_ids = [int(c) for c in task.background_classes]
+                ciba_weight = float(method_phase_cfg.get("enable_ciba", 0.0)) if isinstance(method_phase_cfg.get("enable_ciba"), (int, float)) else (1.0 if method_phase_cfg.get("enable_ciba", False) else 0.0)
+                ctr_weight = float(method_phase_cfg.get("enable_ctr", 0.0)) if isinstance(method_phase_cfg.get("enable_ctr"), (int, float)) else (0.1 if method_phase_cfg.get("enable_ctr", False) else 0.0)
+
+                dataloader = self._build_dataloader(task, class_names=all_class_names, replay_buffer=replay_buffer)
+                eval_dataloader = self._build_dataloader(task, mode="eval", class_names=all_class_names)
+                try:
+                    train_len = len(dataloader.dataset)
+                    eval_len = len(eval_dataloader.dataset)
+                except Exception:
+                    train_len = "?"
+                    eval_len = "?"
+                print(f"[open-continual] task {task.task_id}/{total_tasks} data ready (train={train_len}, eval={eval_len})")
+                ewc_for_train = None
+                if ewc_state_from_ckpt is not None and task.task_id > 1:
+                    ewc_for_train = EWCRegularizer(model, lambda_ewc=self.ewc_lambda)
+                    ewc_for_train.load_state_dict(ewc_state_from_ckpt)
+                train_metrics, optimizer, scheduler = self._train_task(
+                    model, dataloader, all_class_names,
+                    ewc=ewc_for_train, task_id=task.task_id, optimizer_state=optimizer_state,
+                    seen_class_ids=seen_class_ids, unseen_class_ids=unseen_class_ids,
+                    ciba_weight=ciba_weight, ctr_weight=ctr_weight,
+                    ogp_basis=ogp_basis_tensor,
+                )
                 append_metrics_jsonl(self._metrics_path(), {"phase": "train", "task": float(task.task_id), **train_metrics})
-                eval_metrics = self._eval_task(model, dataloader, [f"class_{c}" for c in task.seen_classes])
+                eval_metrics = self._eval_task(model, eval_dataloader, all_class_names, task_id=task.task_id, seen_class_ids=seen_class_ids)
                 append_metrics_jsonl(self._metrics_path(), {"phase": "eval", "task": float(task.task_id), **eval_metrics})
+                print(
+                    f"[open-continual] task {task.task_id}/{total_tasks} | "
+                    f"train_loss={train_metrics.get('train_loss', 'N/A'):.4f} | "
+                    f"mIoU={eval_metrics.get('mIoU', 0.0):.2f} | "
+                    f"acc={eval_metrics.get('accuracy', 0.0):.4f}"
+                )
             mock_progress = _MockTaskProgress(
                 task_id=task.task_id,
                 total_tasks=total_tasks,
@@ -1048,7 +1296,10 @@ class OpenContinualTrainer:
                 n_main=int(task_main_iters),
             ) if self.engine == "mock" else None
             batch = _build_phase_batch(task)
-            if self.engine == "mock":
+            if self.use_real_training:
+                # Real training already done above; skip mock/phase paths
+                p1 = p2 = p3 = p4 = {}
+            elif self.engine == "mock":
                 assert self._mock_model is not None
                 try:
                     try:
@@ -1098,30 +1349,89 @@ class OpenContinualTrainer:
             }
 
             if self.use_real_training and model is not None:
-                alpha_star = _safe_float_or(real_continual.get("alpha_star"), float(p3["alpha_star"]))
-                tau_pred = _safe_float_or(real_continual.get("tau_pred"), float(p3["tau_pred"]))
+                alpha_star = _safe_float_or(real_continual.get("alpha_star"), 0.5)
+                tau_pred = _safe_float_or(real_continual.get("tau_pred"), 1.0)
                 model.inject_alpha_tau(alpha_star, tau_pred)
 
                 if self.ewc_lambda > 0:
                     ewc = EWCRegularizer(model, lambda_ewc=self.ewc_lambda)
-                    _sample_batch = next(iter(dataloader))
                     ewc.compute_fisher(
                         dataloader,
                         loss_fn=lambda inputs, targets: model(
                             inputs,
-                            _sample_batch["class_names"][0] if isinstance(_sample_batch, dict) and "class_names" in _sample_batch else [f"class_{i}" for i in range(model.num_classes)],
+                            all_class_names,
                             targets=targets,
                         )["loss"],
                         n_samples=self.ewc_iters,
                     )
                     ewc.consolidate()
 
+                ewc_state_dict = None
+                if ewc is not None:
+                    ewc_state_dict = ewc.state_dict()
+                elif ewc_state_from_ckpt is not None:
+                    ewc = EWCRegularizer(model, lambda_ewc=self.ewc_lambda)
+                    ewc.load_state_dict(ewc_state_from_ckpt)
+                    ewc_state_dict = ewc.state_dict()
+
+                if self.enable_spectral_ogp and dataloader is not None:
+                    try:
+                        new_basis = compute_gradient_basis(
+                            model=model,
+                            dataloader=dataloader,
+                            loss_fn=lambda inputs, targets: model(
+                                inputs, all_class_names, targets=targets,
+                            )["loss"],
+                            n_samples=min(self.ewc_iters, 200),
+                            top_k=10,
+                            device=next(model.parameters()).device,
+                        )
+                        task_dir.mkdir(parents=True, exist_ok=True)
+                        torch.save(new_basis, task_dir / "ogp_basis.pt")
+                        ogp_basis_tensor = new_basis
+                    except Exception as exc:
+                        _log.warning("OGP basis computation failed: %s", exc)
+
+                if self.enable_sacr and self.m_max_total > 0:
+                    if replay_buffer is None:
+                        replay_buffer = SACRReplayBuffer(
+                            max_total_items=self.m_max_total,
+                            max_per_class=self.m_max_per_class,
+                        )
+                    seen_ids = [int(c) for c in task.seen_classes]
+                    for sample_idx, sample in enumerate(dataloader.dataset):
+                        if isinstance(sample, dict) and "image_id" in sample:
+                            img_path = str(sample.get("image_path", ""))
+                            lbl_path = str(sample.get("mask_path", ""))
+                            if img_path and lbl_path:
+                                for cid in seen_ids:
+                                    replay_buffer.add(ReplayItem(
+                                        image_path=img_path,
+                                        label_path=lbl_path,
+                                        class_id=cid,
+                                        priority=1.0 / (1 + sample_idx),
+                                    ))
+                    task_dir.mkdir(parents=True, exist_ok=True)
+                    replay_buffer.save(task_dir / "replay_buffer.json")
+
                 task_dir.mkdir(parents=True, exist_ok=True)
-                torch.save({
+                checkpoint_dict = {
                     "model_state_dict": model.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict() if optimizer is not None else None,
                     "alpha_star": alpha_star,
                     "tau_pred": tau_pred,
-                }, task_dir / "model.pt")
+                    "task_id": task.task_id,
+                    "total_classes": total_classes,
+                    "clip_model_name": self.clip_model_name,
+                    "dino_model_name": self.dino_model_name,
+                    "clip_finetune": self.clip_finetune,
+                    "ewc_state_dict": ewc_state_dict,
+                }
+                if scheduler is not None:
+                    checkpoint_dict["scheduler_state_dict"] = scheduler.state_dict()
+                torch.save(checkpoint_dict, task_dir / "model.pt")
+
+                (self.output_dir / "latest_model.txt").write_text(str(task_dir / "model.pt"), encoding="utf-8")
 
             eval_payload = None
             if self.engine == "d2":
@@ -1501,13 +1811,15 @@ class OpenContinualTrainer:
                     balanced_prev_eval = current_eval
 
             method_state = method.after_task(task_state={"task_id": task.task_id})
-            alpha_star_history.append(_safe_float_or(real_continual.get("alpha_star"), float(p3["alpha_star"])))
-            tau_pred_history.append(_safe_float_or(real_continual.get("tau_pred"), float(p3["tau_pred"])))
+            alpha_star_history.append(_safe_float_or(real_continual.get("alpha_star"), 0.5))
+            tau_pred_history.append(_safe_float_or(real_continual.get("tau_pred"), 1.0))
             if current_basis:
                 basis_history.append(current_basis)
             latest_model_path = state.get("latest_model_path")
             latest_mock_model_path = state.get("latest_mock_model_path")
-            if self.engine == "d2":
+            if self.use_real_training and model is not None:
+                latest_model_path = str((task_dir / "model.pt").resolve())
+            elif self.engine == "d2":
                 latest_model_path = str(task_dir / "model_final.pth")
             elif self.engine == "mock":
                 assert self._mock_model is not None
@@ -1531,8 +1843,8 @@ class OpenContinualTrainer:
                 "current_task": task.task_id,
                 "method": method.name,
                 "clip_finetune": self.clip_finetune,
-                "alpha_star": _safe_float_or(real_continual.get("alpha_star"), float(p3["alpha_star"])),
-                "tau_pred": _safe_float_or(real_continual.get("tau_pred"), float(p3["tau_pred"])),
+                "alpha_star": _safe_float_or(real_continual.get("alpha_star"), 0.5),
+                "tau_pred": _safe_float_or(real_continual.get("tau_pred"), 1.0),
                 "alpha_star_history": alpha_star_history,
                 "tau_pred_history": tau_pred_history,
                 "basis_history": basis_history,
@@ -1565,7 +1877,14 @@ class OpenContinualTrainer:
                     f"task {task.task_id}/{total_tasks} done | remaining_task_iters=0 | "
                     f"remaining_tasks={remaining_tasks}"
                 )
+            task_pbar.update(1)
+            task_pbar.set_postfix({
+                "task": f"{task.task_id}/{total_tasks}",
+                "loss": f"{_safe_float_or(real_continual.get('alpha_star'), 0.0):.3f}",
+            })
             completed += 1
+
+        task_pbar.close()
 
         if completed > 0:
             try:

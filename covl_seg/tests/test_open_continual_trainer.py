@@ -1670,14 +1670,67 @@ def test_trainer_balanced_controller_does_not_drift_without_eval_signals(tmp_pat
 def test_trainer_real_training_mode(tmp_path, monkeypatch):
     cfg = _write_mock_config(tmp_path)
 
+    class FakeClipVisual(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.linear = torch.nn.Linear(1, 1)
+        def get_dense_features(self, images):
+            return torch.randn(images.shape[0], 10, self.linear.out_features)
+        def eval(self):
+            return self
+
+    class FakeDino(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.linear = torch.nn.Linear(1, 1)
+        def forward(self, images):
+            B, _, H, W = images.shape
+            return {
+                "res3": torch.randn(B, 384, H // 8, W // 8),
+                "res4": torch.randn(B, 384, H // 16, W // 16),
+                "res5": torch.randn(B, 384, H // 32, W // 32),
+            }
+        def eval(self):
+            return self
+
+    class FakeClipText(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.linear = torch.nn.Linear(1, 1)
+        def forward(self, class_names):
+            return torch.randn(len(class_names), self.linear.out_features)
+
+    class FakeHcibaHead(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.linear = torch.nn.Linear(1, 1)
+        def forward(self, clip_dense, dino_features):
+            B = clip_dense.shape[0]
+            H, W = 4, 4
+            dummy = self.linear(torch.ones(1, 1))
+            result = torch.randn(B, 1, H, W, requires_grad=True)
+            return result + dummy.sum() * 0
+
+    class FakeFusionHead(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.linear = torch.nn.Linear(1, 1)
+            self.alpha = torch.nn.Parameter(torch.tensor(0.5))
+            self.tau = torch.nn.Parameter(torch.tensor(1.0))
+        def forward(self, backbone_logits, clip_logits, text_embeddings):
+            dummy = self.linear(torch.ones(1, 1))
+            return backbone_logits + dummy.sum() * 0
+
     class FakeModel(torch.nn.Module):
         def __init__(self, num_classes):
             super().__init__()
             self.num_classes = num_classes
-            self.hciba_head = torch.nn.Linear(1, 1)
-            self.fusion_head = torch.nn.Linear(1, 1)
-            self.clip_logit_proj = torch.nn.Linear(1, 1)
-            self.clip_text = torch.nn.Linear(1, 1)
+            self.hciba_head = FakeHcibaHead()
+            self.fusion_head = FakeFusionHead()
+            self.clip_logit_proj = torch.nn.Linear(1, 768)
+            self.clip_text = FakeClipText()
+            self.clip_visual = FakeClipVisual()
+            self.dino = FakeDino()
             self._called_train = False
             self._called_eval = False
             self._alpha_set = False
@@ -1705,7 +1758,7 @@ def test_trainer_real_training_mode(tmp_path, monkeypatch):
     fake_model = FakeModel(num_classes=2)
 
     class FakeDataset:
-        def __init__(self, root, split, class_names):
+        def __init__(self, root, split, class_names, augmentation=None, num_classes=164):
             self.class_names = class_names
 
         def __len__(self):
@@ -1719,7 +1772,7 @@ def test_trainer_real_training_mode(tmp_path, monkeypatch):
             }
 
     class FakeDataLoader:
-        def __init__(self, dataset, batch_size, shuffle, num_workers):
+        def __init__(self, dataset, batch_size, shuffle, num_workers, pin_memory=False):
             self.dataset = dataset
 
         def __iter__(self):

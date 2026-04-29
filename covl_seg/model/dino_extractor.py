@@ -99,6 +99,11 @@ class DINOv2FeatureExtractor(nn.Module):
 
     def forward(self, images: torch.Tensor) -> Dict[str, torch.Tensor]:
         B, _, H, W = images.shape
+        pad_h = (self.PATCH_SIZE - H % self.PATCH_SIZE) % self.PATCH_SIZE
+        pad_w = (self.PATCH_SIZE - W % self.PATCH_SIZE) % self.PATCH_SIZE
+        if pad_h > 0 or pad_w > 0:
+            images = F.pad(images, (0, pad_w, 0, pad_h), value=0)
+        _, _, Hp, Wp = images.shape
         self._intermediate.clear()
 
         with torch.no_grad():
@@ -108,12 +113,12 @@ class DINOv2FeatureExtractor(nn.Module):
         for name, stride in self.STRIDES.items():
             feat = self._intermediate[name]
             feat = feat[:, 1:, :]
-            n_patches_h = H // self.PATCH_SIZE
-            n_patches_w = W // self.PATCH_SIZE
+            n_patches_h = Hp // self.PATCH_SIZE
+            n_patches_w = Wp // self.PATCH_SIZE
             feat = feat.reshape(B, n_patches_h, n_patches_w, -1)
             feat = feat.permute(0, 3, 1, 2)
-            target_h = H // stride
-            target_w = W // stride
+            target_h = Hp // stride
+            target_w = Wp // stride
             if feat.shape[2] != target_h or feat.shape[3] != target_w:
                 feat = F.interpolate(
                     feat,
@@ -121,5 +126,7 @@ class DINOv2FeatureExtractor(nn.Module):
                     mode="bilinear",
                     align_corners=False,
                 )
+            if pad_h > 0 or pad_w > 0:
+                feat = feat[:, :, :H // stride, :W // stride]
             result[name] = feat
         return result
